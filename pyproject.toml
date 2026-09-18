@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "svjsim"
+version = "0.4.0"
+description = "Open-source vehicle dynamics simulator for SVJ (Standard Vehicle JSON) vehicles"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "RFloEng" }]
+keywords = [
+    "vehicle-dynamics", "simulation", "svj", "pacejka", "suspension",
+    "kinematics", "carsim", "moose-test", "friction-circle",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "numpy>=1.26",
+    "svj @ git+https://github.com/RFloEng/SVJ-standard-vehicle-json.git#subdirectory=svj-py",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/RFloEng/SVJSim"
+Repository = "https://github.com/RFloEng/SVJSim"
+Issues = "https://github.com/RFloEng/SVJSim/issues"
+Changelog = "https://github.com/RFloEng/SVJSim/blob/main/CHANGELOG.md"
+"SVJ standard" = "https://github.com/RFloEng/SVJ-standard-vehicle-json"
+
+[project.scripts]
+svjsim = "svjsim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["svjsim*"]
+
+[tool.setuptools.package-data]
+svjsim = ["webapp.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

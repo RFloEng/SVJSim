@@ -1,0 +1,1463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SVJSim</title>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+:root{
+  --bg:#0f1116; --panel:#171a21; --panel2:#1d212a; --line:#2a2f3a; --text:#e6e8ee;
+  --muted:#8e97ab; --accent:#5aa9e6; --good:#58c08a; --warn:#e0b341; --bad:#e06c5f;
+  --est:#b98ce0;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;overflow:hidden}
+button{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);
+  border-radius:7px;padding:7px 13px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent);color:#fff}
+button:disabled{opacity:.42;cursor:not-allowed}
+button.primary{background:var(--accent);border-color:var(--accent);color:#08121c;font-weight:600}
+button.primary:hover:not(:disabled){filter:brightness(1.12);color:#08121c}
+select,input[type=number]{font:inherit;color:inherit;background:var(--panel2);
+  border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+input[type=range]{width:100%;accent-color:var(--accent)}
+.app{display:flex;flex-direction:column;height:100vh}
+
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;
+  border-bottom:1px solid var(--line);background:var(--panel);flex:none}
+header h1{font-size:16px;margin:0;letter-spacing:.02em}
+header h1 span{color:var(--accent)}
+#vehicleName{font-weight:600}
+#vehicleSub{color:var(--muted);font-size:12px}
+.spacer{flex:1}
+.tag{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
+.tag.good{background:rgba(88,192,138,.16);color:var(--good)}
+.tag.warn{background:rgba(224,179,65,.16);color:var(--warn)}
+.tag.bad{background:rgba(224,108,95,.16);color:var(--bad)}
+.tag.est{background:rgba(185,140,224,.16);color:var(--est)}
+.tag.none{background:rgba(142,151,171,.14);color:var(--muted)}
+
+main{flex:1;display:grid;grid-template-columns:290px minmax(0,1fr) 390px;min-height:0}
+@media (max-width:1280px){ main{grid-template-columns:250px minmax(0,1fr) 330px} }
+@media (max-width:1040px){
+  main{grid-template-columns:minmax(0,1fr) 330px}
+  #setupPanel{display:none}
+}
+@media (max-width:720px){ main{grid-template-columns:minmax(0,1fr)} aside.right{display:none} }
+header{flex-wrap:wrap}
+#examples{max-width:230px}
+aside,section{min-height:0;overflow:auto}
+aside{background:var(--panel);border-right:1px solid var(--line);padding:0 0 30px}
+aside.right{border-right:none;border-left:1px solid var(--line)}
+.panelhead{position:sticky;top:0;background:var(--panel);padding:12px 14px 9px;
+  border-bottom:1px solid var(--line);z-index:5;display:flex;align-items:center;gap:8px}
+.panelhead h2{font-size:12px;margin:0;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.09em;flex:1}
+.group{padding:10px 14px 4px}
+.group h3{font-size:11px;color:var(--accent);margin:8px 0 8px;text-transform:uppercase;
+  letter-spacing:.08em}
+.field{margin-bottom:13px}
+.field .top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.field label{font-size:12px;color:var(--muted)}
+.field .val{font-variant-numeric:tabular-nums;font-size:12px}
+.field .val.changed{color:var(--warn);font-weight:600}
+.actions{padding:10px 14px;display:flex;gap:8px;flex-wrap:wrap;
+  position:sticky;bottom:0;background:var(--panel);border-top:1px solid var(--line)}
+
+#viewport{position:relative;background:#0b0d12}
+#three{position:absolute;inset:0}
+#viewhud{position:absolute;left:12px;top:12px;font-size:12px;color:var(--muted);
+  background:rgba(15,17,22,.72);border:1px solid var(--line);border-radius:8px;
+  padding:8px 11px;pointer-events:none;font-variant-numeric:tabular-nums}
+#playbar{position:absolute;left:12px;right:12px;bottom:12px;background:rgba(15,17,22,.9);
+  border:1px solid var(--line);border-radius:9px;padding:9px 12px;display:none;
+  align-items:center;gap:11px}
+#playbar.on{display:flex}
+#playbar input[type=range]{flex:1}
+#playtime{font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted);min-width:118px}
+
+.card{margin:12px 14px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:9px;padding:11px 13px}
+.card h4{margin:0 0 9px;font-size:12px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.07em}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:12px}
+th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+td.num,th.num{text-align:right}
+tbody tr:last-child td{border-bottom:none}
+.chart{height:210px;margin-top:6px}
+ul.msgs{margin:6px 0 0;padding-left:18px}
+ul.msgs li{margin:4px 0;color:var(--muted);font-size:12px}
+.progress{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:8px}
+.progress i{display:block;height:100%;background:var(--accent);width:0;transition:width .2s}
+.empty{color:var(--muted);text-align:center;padding:38px 18px;font-size:13px}
+#drop{position:fixed;inset:0;background:rgba(10,12,16,.93);display:none;
+  align-items:center;justify-content:center;z-index:50;flex-direction:column;gap:16px}
+#drop.on{display:flex}
+#drop .box{border:2px dashed var(--accent);border-radius:16px;padding:52px 76px;
+  text-align:center;font-size:17px}
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:24px;background:var(--panel2);
+  border:1px solid var(--line);border-radius:9px;padding:10px 17px;z-index:60;display:none;
+  max-width:70vw}
+#toast.on{display:block}
+#toast.bad{border-color:var(--bad);color:var(--bad)}
+.hint{color:var(--muted);font-size:11px;margin-top:6px}
+.tabrow{display:flex;gap:6px;flex:1}
+.tabbtn{background:transparent;border:1px solid var(--line);border-radius:7px;padding:5px 12px;
+  color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
+.tabbtn.active{background:var(--panel2);color:var(--text);border-color:var(--accent)}
+.keyhint{display:inline-block;background:var(--panel2);border:1px solid var(--line);
+  border-radius:5px;padding:1px 6px;font-family:ui-monospace,Consolas,monospace;font-size:11px;margin:1px 2px}
+.drivestat{display:flex;justify-content:space-between;padding:4px 0;font-size:12px;color:var(--muted)}
+.drivestat b{color:var(--text);font-variant-numeric:tabular-nums;font-weight:600}
+#viewhud{line-height:1.55}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>SVJ<span>Sim</span></h1>
+    <div>
+      <div id="vehicleName">No vehicle loaded</div>
+      <div id="vehicleSub">Drop an .svj.json file anywhere, or pick one</div>
+    </div>
+    <span id="confidence"></span>
+    <div class="spacer"></div>
+    <select id="examples" title="SVJ files found near the install"></select>
+    <button id="openBtn">Open</button>
+    <button id="fileBtn">Load file…</button>
+    <button id="exportBtn" disabled title="Download the current setup as an SVJ override file">Export override</button>
+    <input type="file" id="fileInput" accept=".json" hidden>
+  </header>
+
+  <main>
+    <aside id="setupPanel">
+      <div class="panelhead"><h2>Setup</h2><span id="setupDirty" class="tag warn" style="display:none">changed</span></div>
+      <div id="setupBody"><div class="empty">Load a vehicle to edit its setup.</div></div>
+    </aside>
+
+    <section id="viewport">
+      <div id="three"></div>
+      <div id="viewhud">—</div>
+      <div id="playbar">
+        <button id="playBtn">▶</button>
+        <input type="range" id="playSlider" min="0" max="100" value="0">
+        <span id="playtime">0.00 s</span>
+        <select id="playSpeed"><option value="1">1×</option><option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option><option value="2">2×</option></select>
+      </div>
+    </section>
+
+    <aside class="right" id="resultsPanel">
+      <div class="panelhead">
+        <div class="tabrow">
+          <button class="tabbtn active" id="tabTests">Tests</button>
+          <button class="tabbtn" id="tabDrive">Drive</button>
+        </div>
+      </div>
+
+      <div id="testsTab">
+        <div class="group">
+          <div class="field">
+            <div class="top"><label for="testSelect">Maneuver</label></div>
+            <select id="testSelect" style="width:100%;margin-top:5px"></select>
+          </div>
+          <div id="testOptions"></div>
+          <div class="field">
+            <div class="top"><label for="friction">Road friction</label>
+              <span class="val" id="frictionVal">1.00</span></div>
+            <input type="range" id="friction" min="0.2" max="1.4" step="0.05" value="1">
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="primary" id="runBtn" disabled style="flex:1">Run test</button>
+            <button id="baselineBtn" disabled title="Keep this run to compare the next one against">Set baseline</button>
+          </div>
+          <div class="progress" id="runProgress" style="display:none"><i></i></div>
+          <div class="hint" id="runHint"></div>
+        </div>
+        <div id="resultsBody"><div class="empty">No results yet — pick a maneuver and run it.</div></div>
+        <div id="vehicleCards"></div>
+      </div>
+
+      <div id="driveTab" style="display:none">
+        <div class="group">
+          <div class="field">
+            <div class="top"><label for="driveSpeed">Start speed</label>
+              <span class="val" id="driveSpeedVal">0 km/h</span></div>
+            <input type="range" id="driveSpeed" min="0" max="180" step="5" value="0">
+          </div>
+          <div class="field">
+            <div class="top"><label for="driveGear">Start gear</label></div>
+            <select id="driveGear" style="width:100%;margin-top:5px"></select>
+          </div>
+          <button class="primary" id="driveStartBtn" style="width:100%" disabled>Start driving</button>
+          <button id="driveStopBtn" style="width:100%;display:none">Stop driving</button>
+        </div>
+        <div class="card" id="driveStatus" style="display:none">
+          <h4>Input</h4>
+          <div class="drivestat"><span>Source</span><b id="inputSource">keyboard</b></div>
+          <div class="drivestat"><span>Shifting</span><b id="shiftMode">auto</b></div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button id="shiftDownBtn" style="flex:1">▼ gear</button>
+            <button id="shiftUpBtn" style="flex:1">gear ▲</button>
+            <button id="autoShiftBtn" style="flex:1">Auto</button>
+          </div>
+          <button id="driveResetBtn" style="width:100%;margin-top:8px">Reset car (R)</button>
+          <div class="hint" style="margin-top:12px;line-height:1.9">
+            <span class="keyhint">W</span><span class="keyhint">↑</span> throttle &nbsp;
+            <span class="keyhint">S</span><span class="keyhint">↓</span> brake &nbsp;
+            <span class="keyhint">A</span><span class="keyhint">D</span> /
+            <span class="keyhint">←</span><span class="keyhint">→</span> steer<br>
+            <span class="keyhint">Space</span> handbrake &nbsp;
+            <span class="keyhint">Q</span><span class="keyhint">E</span> shift &nbsp;
+            <span class="keyhint">R</span> reset<br>
+            A connected gamepad or wheel is used automatically once a button or
+            axis on it moves.
+          </div>
+        </div>
+        <div class="hint" id="driveGamepadDebug" style="margin:0 14px"></div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<div id="drop"><div class="box">Drop an <b>.svj.json</b> vehicle here</div></div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+// ── State ────────────────────────────────────────────────────────────
+const S = {
+  data: null,            // last /api/load or /api/setup payload
+  setupValues: {},       // id -> current slider value
+  result: null,          // last finished run
+  baseline: null,        // run kept for comparison
+  playing: false,
+  frame: 0,
+  lastTick: 0,
+};
+
+const $ = (id) => document.getElementById(id);
+const fmt = (v, d = 2) => (v === null || v === undefined || !isFinite(v)) ? "—" : Number(v).toFixed(d);
+
+function toast(message, bad) {
+  const el = $("toast");
+  el.textContent = message;
+  el.className = "on" + (bad ? " bad" : "");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { el.className = ""; }, bad ? 7000 : 3200);
+}
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const payload = await response.json();
+  if (!response.ok || payload.error) throw new Error(payload.error || response.statusText);
+  return payload;
+}
+
+// ── Loading a vehicle ────────────────────────────────────────────────
+async function loadDocument(text, name) {
+  try {
+    const data = await api("/api/load", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document: text, name })
+    });
+    applyVehicle(data, true);
+    toast(`Loaded ${data.name}`);
+  } catch (err) { toast(String(err.message || err), true); }
+}
+
+function applyVehicle(data, resetSetup) {
+  if (Drive.active) driveStop(true);       // a rebuild invalidates any drive session
+  S.data = data;
+  if (resetSetup) {
+    S.setupValues = {};
+    data.setup.forEach(f => { S.setupValues[f.id] = f.value; });
+  }
+  $("vehicleName").textContent = data.name;
+  const i = data.info;
+  $("vehicleSub").textContent =
+    `${i.mass_total} kg · ${i.wheelbase} m wheelbase · ${i.station_count} stations`
+    + (i.gears ? ` · ${i.gears}-speed` : "");
+  const conf = data.report.confidence;
+  $("confidence").innerHTML =
+    `<span class="tag ${conf === "high" ? "good" : conf === "medium" ? "warn" : "bad"}">${conf} confidence</span>`;
+  $("runBtn").disabled = false;
+  $("exportBtn").disabled = false;
+  $("driveStartBtn").disabled = false;
+  renderSetup();
+  renderTests();
+  renderVehicleCards();
+  populateDriveOptions();
+  Viewer.build(data);
+}
+
+function populateDriveOptions() {
+  const select = $("driveGear");
+  const previous = select.value;
+  select.innerHTML = "";
+  const gears = S.data.info.gears || 1;
+  for (let g = 1; g <= gears; g++) select.add(new Option(`Gear ${g}`, g));
+  select.value = (previous && parseInt(previous, 10) <= gears) ? previous : "1";
+}
+
+// ── Setup panel ──────────────────────────────────────────────────────
+function renderSetup() {
+  const groups = new Map();
+  S.data.setup.forEach(f => {
+    if (!groups.has(f.group)) groups.set(f.group, []);
+    groups.get(f.group).push(f);
+  });
+  let html = "";
+  for (const [name, fields] of groups) {
+    html += `<div class="group"><h3>${name}</h3>`;
+    fields.forEach(f => {
+      const v = S.setupValues[f.id];
+      const changed = Math.abs(v - f.value) > 1e-9;
+      html += `<div class="field" data-id="${f.id}">
+        <div class="top"><label>${f.label}</label>
+          <span class="val ${changed ? "changed" : ""}">${trim(v)} ${f.unit === "-" ? "" : f.unit}</span></div>
+        <input type="range" min="${f.min}" max="${f.max}" step="${f.step}" value="${v}">
+      </div>`;
+    });
+    html += `</div>`;
+  }
+  $("setupBody").innerHTML = html + `<div class="actions">
+      <button class="primary" id="applyBtn" style="flex:1">Apply</button>
+      <button id="resetBtn">Reset</button></div>`;
+
+  $("setupBody").querySelectorAll(".field").forEach(field => {
+    const id = field.dataset.id;
+    const spec = S.data.setup.find(f => f.id === id);
+    const slider = field.querySelector("input");
+    slider.addEventListener("input", () => {
+      S.setupValues[id] = parseFloat(slider.value);
+      const label = field.querySelector(".val");
+      label.textContent = `${trim(S.setupValues[id])} ${spec.unit === "-" ? "" : spec.unit}`;
+      label.classList.toggle("changed", Math.abs(S.setupValues[id] - spec.value) > 1e-9);
+      markDirty();
+    });
+  });
+  $("applyBtn").onclick = applySetup;
+  $("resetBtn").onclick = () => {
+    S.data.setup.forEach(f => { S.setupValues[f.id] = f.value; });
+    renderSetup(); applySetup();
+  };
+  markDirty();
+}
+
+function trim(v) {
+  const a = Math.abs(v);
+  return a >= 1000 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function markDirty() {
+  const dirty = S.data.setup.some(f => Math.abs(S.setupValues[f.id] - f.value) > 1e-9);
+  $("setupDirty").style.display = dirty ? "" : "none";
+}
+
+async function applySetup() {
+  const button = $("applyBtn");
+  button.disabled = true; button.textContent = "Rebuilding…";
+  try {
+    const data = await api("/api/setup", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values: S.setupValues, friction: parseFloat($("friction").value) })
+    });
+    // Keep the slider positions; only the derived model changed.
+    const values = S.setupValues;
+    applyVehicle(data, false);
+    S.setupValues = values;
+    renderSetup();
+    const count = Object.keys(data.patch || {}).length;
+    toast(count ? "Rebuilt with your setup changes" : "Rebuilt at the file's own setup");
+  } catch (err) { toast(String(err.message || err), true); }
+  finally { const b = $("applyBtn"); if (b) { b.disabled = false; b.textContent = "Apply"; } }
+}
+
+// ── Vehicle cards ────────────────────────────────────────────────────
+function renderVehicleCards() {
+  const host = $("vehicleCards");
+  if (!host || !S.data) return;
+  const d = S.data;
+  const rows = d.stations.map(s => `<tr>
+    <td>${s.name}${s.driven ? ' <span class="tag none">drv</span>' : ""}</td>
+    <td class="num">${fmt(s.static_load, 0)}</td>
+    <td class="num">${fmt(s.spring_rate / 1000, 1)}</td>
+    <td class="num">${fmt(s.ride_frequency, 2)}</td>
+    <td class="num">${fmt(s.damping_ratio, 2)}</td>
+    <td class="num">${fmt(s.camber, 2)}</td>
+    <td class="num">${s.roll_centre === null ? "—" : fmt(s.roll_centre, 0)}</td>
+    <td>${s.tire_estimated ? '<span class="tag est">est</span>' : '<span class="tag none">' + s.tire.split("/")[0] + "</span>"}</td>
+  </tr>`).join("");
+
+  const msgs = (title, items, cls) => items.length
+    ? `<h4><span class="tag ${cls}">${title}</span></h4><ul class="msgs">${items.map(m => `<li>${escapeHtml(m)}</li>`).join("")}</ul>` : "";
+
+  host.innerHTML = `
+    <div class="card"><h4>Wheel stations</h4>
+      <table><thead><tr><th>Station</th><th class="num">Load N</th><th class="num">kN/m</th>
+      <th class="num">Hz</th><th class="num">ζ</th><th class="num">Camber°</th>
+      <th class="num">RC mm</th><th>Tire</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="card"><h4>Where this model came from</h4>
+      ${msgs("Warnings", d.report.warnings, "bad")}
+      ${msgs("Estimates", d.report.estimates, "est")}
+      ${msgs("Notes", d.report.notes, "none")}
+      ${(!d.report.warnings.length && !d.report.estimates.length && !d.report.notes.length)
+        ? '<div class="hint">Nothing had to be assumed — the file describes this vehicle completely.</div>' : ""}
+    </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+function renderTests() {
+  const select = $("testSelect");
+  if (!select.options.length) {
+    S.data.tests.forEach(t => select.add(new Option(t.label, t.id)));
+    select.onchange = renderTestOptions;
+  }
+  renderTestOptions();
+}
+
+function renderTestOptions() {
+  const test = S.data.tests.find(t => t.id === $("testSelect").value);
+  $("testOptions").innerHTML = (test.options || []).map(o => `
+    <div class="field" data-opt="${o.id}">
+      <div class="top"><label>${o.label}</label><span class="val">${o.value} ${o.unit}</span></div>
+      <input type="range" min="${o.min}" max="${o.max}" step="${o.step}" value="${o.value}">
+    </div>`).join("");
+  $("testOptions").querySelectorAll(".field").forEach(f => {
+    const input = f.querySelector("input");
+    input.addEventListener("input", () => {
+      f.querySelector(".val").textContent =
+        `${trim(parseFloat(input.value))} ${f.querySelector("label").nextSibling ? "" : ""}`;
+      const spec = test.options.find(o => o.id === f.dataset.opt);
+      f.querySelector(".val").textContent = `${trim(parseFloat(input.value))} ${spec.unit}`;
+    });
+  });
+}
+
+function currentOptions() {
+  const options = {};
+  $("testOptions").querySelectorAll(".field").forEach(f => {
+    options[f.dataset.opt] = parseFloat(f.querySelector("input").value);
+  });
+  return options;
+}
+
+async function runTest() {
+  const button = $("runBtn");
+  button.disabled = true; button.textContent = "Running…";
+  $("runProgress").style.display = "";
+  $("runProgress").firstElementChild.style.width = "0%";
+  $("runHint").textContent = "";
+  try {
+    const { id } = await api("/api/run", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ test: $("testSelect").value, options: currentOptions() })
+    });
+    while (true) {
+      await new Promise(r => setTimeout(r, 400));
+      const status = await api("/api/run?id=" + id);
+      $("runProgress").firstElementChild.style.width = Math.round(status.progress * 100) + "%";
+      if (status.status === "done") { showResult(status.result); break; }
+      if (status.status === "failed") { throw new Error(status.error); }
+    }
+  } catch (err) { toast(String(err.message || err), true); $("runHint").textContent = String(err.message || err); }
+  finally {
+    button.disabled = false; button.textContent = "Run test";
+    $("runProgress").style.display = "none";
+  }
+}
+
+function showResult(result) {
+  S.result = result;
+  $("baselineBtn").disabled = false;
+  const kpiRows = result.kpis.map(k => {
+    let bench = "—", verdict = "";
+    if (k.benchmark !== null && k.benchmark !== undefined) {
+      const error = k.value / k.benchmark - 1;
+      bench = `${trim(k.benchmark)} ${k.unit}`;
+      verdict = `<span class="tag ${k.verdict === "match" ? "good" : "warn"}">${(error * 100 >= 0 ? "+" : "")}${(error * 100).toFixed(1)}%</span>`;
+    }
+    let delta = "";
+    if (S.baseline) {
+      const previous = S.baseline.kpis.find(b => b.key === k.key);
+      if (previous && previous.value) {
+        const change = k.value / previous.value - 1;
+        delta = Math.abs(change) < 1e-4 ? '<span class="tag none">=</span>'
+          : `<span class="tag ${change > 0 ? "good" : "bad"}">${change > 0 ? "+" : ""}${(change * 100).toFixed(1)}%</span>`;
+      }
+    }
+    return `<tr><td>${escapeHtml(k.label)}</td><td class="num">${trim(k.value)} ${k.unit}</td>
+      <td class="num">${bench}</td><td class="num">${verdict || delta}</td></tr>`;
+  }).join("");
+
+  const notes = result.notes.length
+    ? `<ul class="msgs">${result.notes.map(n => `<li>${escapeHtml(n)}</li>`).join("")}</ul>` : "";
+
+  $("resultsBody").innerHTML = `
+    <div class="card"><h4>${escapeHtml(result.maneuver)}
+      ${result.passed ? "" : '<span class="tag bad">incomplete</span>'}
+      ${S.baseline ? '<span class="tag none">vs baseline</span>' : ""}</h4>
+      <table><thead><tr><th>Measure</th><th class="num">Value</th>
+        <th class="num">Benchmark</th><th class="num">Δ</th></tr></thead>
+        <tbody>${kpiRows || '<tr><td colspan="4">No KPIs</td></tr>'}</tbody></table>
+      ${notes}</div>
+    <div class="card"><h4>Traces</h4>
+      <div class="chart" id="chart1"></div>
+      <div class="chart" id="chart2"></div>
+      <div class="chart" id="chart3"></div></div>`;
+  drawCharts(result);
+  Viewer.attachRun(result);
+}
+
+const PLOT_LAYOUT = {
+  paper_bgcolor: "#1d212a", plot_bgcolor: "#1d212a",
+  font: { color: "#e6e8ee", size: 10 }, margin: { l: 46, r: 12, t: 22, b: 34 },
+  xaxis: { gridcolor: "#2a2f3a", zerolinecolor: "#39404e" },
+  yaxis: { gridcolor: "#2a2f3a", zerolinecolor: "#39404e" },
+  showlegend: true, legend: { orientation: "h", y: -0.3, font: { size: 9 } },
+  colorway: ["#5aa9e6", "#58c08a", "#e0b341", "#e06c5f", "#b98ce0", "#6fd4d4"]
+};
+
+function plot(div, traces, title, xtitle, ytitle, extra) {
+  const layout = JSON.parse(JSON.stringify(PLOT_LAYOUT));
+  layout.title = { text: title, font: { size: 11 } };
+  layout.xaxis.title = { text: xtitle, font: { size: 10 } };
+  layout.yaxis.title = { text: ytitle, font: { size: 10 } };
+  Object.assign(layout, extra || {});
+  Plotly.newPlot(div, traces, layout, { displayModeBar: false, responsive: true });
+}
+
+function line(result, x, y, name, scale) {
+  const ch = result.channels;
+  if (!ch[x] || !ch[y]) return null;
+  return { x: ch[x], y: scale ? ch[y].map(v => v === null ? null : v * scale) : ch[y],
+           name, type: "scatter", mode: "lines" };
+}
+
+function drawCharts(result) {
+  const ch = result.channels;
+  const points = result.detail && result.detail.points;
+  if (points && points.length) {
+    plot("chart1", [{ x: points.map(p => p[0]), y: points.map(p => p[1]), mode: "markers",
+      type: "scatter", marker: { size: 6, color: "#5aa9e6" }, name: "g-g" }],
+      "Combined grip envelope", "Lateral (g)", "Longitudinal (g)",
+      { yaxis: Object.assign({}, PLOT_LAYOUT.yaxis, { scaleanchor: "x", scaleratio: 1, title: { text: "Longitudinal (g)", font: { size: 10 } } }) });
+  } else if (result.detail && result.detail.path) {
+    const traces = [{ x: result.detail.path.map(p => p[0]), y: result.detail.path.map(p => p[1]),
+      name: "reference", type: "scatter", mode: "lines", line: { dash: "dash", color: "#8e97ab" } }];
+    const driven = line(result, "x", "y", "driven");
+    if (driven) traces.push(driven);
+    (result.detail.gates || []).forEach(g => {
+      [g[2] - g[3], g[2] + g[3]].forEach(edge => traces.push({ x: [g[0], g[1]], y: [edge, edge],
+        type: "scatter", mode: "lines", showlegend: false, line: { color: "#e06c5f", width: 2 } }));
+    });
+    plot("chart1", traces, "Course", "Distance (m)", "Lateral (m)",
+      { yaxis: Object.assign({}, PLOT_LAYOUT.yaxis, { scaleanchor: "x", scaleratio: 1 }) });
+  } else {
+    const t = [line(result, "time", "speed_kph", "speed (km/h)")].filter(Boolean);
+    plot("chart1", t, "Speed", "Time (s)", "km/h");
+  }
+
+  const accel = [line(result, "time", "ay_g", "lateral (g)"),
+                 line(result, "time", "ax_g", "longitudinal (g)")].filter(Boolean);
+  if (accel.length) plot("chart2", accel, "Acceleration", "Time (s)", "g");
+
+  const loads = Object.keys(ch).filter(k => k.startsWith("Fz_") && k !== "Fz_total")
+    .map(k => line(result, "time", k, k.slice(3))).filter(Boolean);
+  if (loads.length) plot("chart3", loads, "Vertical tire load", "Time (s)", "N");
+}
+
+// ── 3D viewer ────────────────────────────────────────────────────────
+const Viewer = (() => {
+  let renderer, scene, camera, controls, root, stations = [], body, run = null, info = null;
+  let chassisBox = null, chassisEdges = null;
+  const COLOR = { link: 0x5aa9e6, wheel: 0x2b303a, rim: 0x8e99ad,
+                  chassis: 0x59647a, cg: 0xe0b341 };
+
+  // SVJ is X forward, Y right, Z down; three.js is Y up.
+  const toThree = (p) => new THREE.Vector3(p[0], -p[2], p[1]);
+
+  function init() {
+    const host = $("three");
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    host.appendChild(renderer.domElement);
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0d12);
+    // A long lens: a wide one this close makes the near wheel look twice the
+    // size of the far one, which reads as a modelling error rather than perspective.
+    camera = new THREE.PerspectiveCamera(32, 1, 0.05, 400);
+    camera.position.set(6.5, 3.4, 6.5);
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x20242c, 1.05));
+    const key = new THREE.DirectionalLight(0xffffff, 0.75);
+    key.position.set(5, 9, 4); scene.add(key);
+    const grid = new THREE.GridHelper(40, 40, 0x2a2f3a, 0x1b1f27);
+    scene.add(grid);
+    root = new THREE.Group(); scene.add(root);
+    resize(); window.addEventListener("resize", resize);
+    animate();
+  }
+
+  function resize() {
+    const host = $("three");
+    if (!host.clientWidth) return;
+    renderer.setSize(host.clientWidth, host.clientHeight);
+    camera.aspect = host.clientWidth / host.clientHeight;
+    camera.updateProjectionMatrix();
+  }
+
+  function clear() {
+    while (root.children.length) {
+      const child = root.children.pop();
+      child.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+      root.remove(child);
+    }
+    stations = [];
+    chassisBox = null; chassisEdges = null;
+  }
+
+  function build(data) {
+    if (!renderer) init();
+    clear();
+    info = data.info;
+    run = null; $("playbar").classList.remove("on");
+
+    body = new THREE.Group(); root.add(body);
+
+    // Chassis as a simple box spanning the wheelbase and track.
+    const xs = data.geometry.map(g => g.wheel_center0[0]);
+    const ys = data.geometry.map(g => Math.abs(g.wheel_center0[1]));
+    const length = Math.max(...xs) - Math.min(...xs);
+    const width = 2 * Math.max(...ys);
+    // Proportioned from the data rather than fixed: bodies overhang the axles,
+    // sit about as wide as the track, and stand roughly twice the CG height.
+    const height = Math.max(0.5, Math.abs(data.info.cg[2]) * 1.9);
+    const box = new THREE.Mesh(
+      new THREE.BoxGeometry(Math.max(length * 1.12, 0.8), height, Math.max(width * 0.96, 0.6)),
+      new THREE.MeshStandardMaterial({ color: COLOR.chassis, transparent: true, opacity: 0.4,
+        roughness: 0.85 }));
+    box.position.copy(toThree([(Math.max(...xs) + Math.min(...xs)) / 2, 0, data.info.cg[2]]));
+    body.add(box);
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(box.geometry),
+      new THREE.LineBasicMaterial({ color: 0x8e99ad, transparent: true, opacity: 0.45 }));
+    edges.position.copy(box.position);
+    body.add(edges);
+    chassisBox = box; chassisEdges = edges;
+
+    const cg = new THREE.Mesh(new THREE.SphereGeometry(0.07, 18, 14),
+      new THREE.MeshStandardMaterial({ color: COLOR.cg }));
+    cg.position.copy(toThree(data.info.cg)); body.add(cg);
+
+    data.geometry.forEach(g => stations.push(buildStation(g)));
+    fitCamera(length, width);
+    updatePose();
+    // Station visual meshes are only positioned by articulateStations() inside
+    // updatePose(), which already ran synchronously above -- a freshly
+    // attached mesh needs one more pose pass or it sits at its group's
+    // identity transform until the next frame/drive update happens to fire.
+    attachVisualMeshes(data)
+      .then(() => updatePose())
+      .catch(err => console.warn("SVJSim: visual mesh attachment failed", err));
+  }
+
+  function buildStation(g) {
+    const group = new THREE.Group(); body.add(group);
+    const linkMaterial = new THREE.LineBasicMaterial({ color: COLOR.link });
+
+    const links = g.links.map(link => {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(
+        new Float32Array(link.inboard.length * 6), 3));
+      const lines = new THREE.LineSegments(geometry, linkMaterial);
+      group.add(lines);
+      return { spec: link, lines };
+    });
+
+    const radius = g.wheel.radius || 0.3;
+    const width = Math.max(g.wheel.width, 0.12);
+    const wheel = new THREE.Mesh(
+      new THREE.CylinderGeometry(radius, radius, width, 28),
+      new THREE.MeshStandardMaterial({ color: COLOR.wheel, roughness: 0.8, metalness: 0.05 }));
+    group.add(wheel);
+    // A rim disc, so camber and steer are readable at a glance.
+    const rimRadius = radius * 0.62;
+    const rim = new THREE.Mesh(
+      new THREE.CylinderGeometry(rimRadius, rimRadius, width * 1.02, 24),
+      new THREE.MeshStandardMaterial({ color: COLOR.rim, roughness: 0.35, metalness: 0.65 }));
+    wheel.add(rim);
+    // A bright lip torus at the rim's outer edge and a subtle sidewall
+    // highlight at the tyre's, each side — cheap, but they're what actually
+    // sells "wheel" over "two stacked cylinders" from any angle.
+    const lipGeo = new THREE.TorusGeometry(rimRadius, 0.006, 8, 28);
+    const lipMat = new THREE.MeshStandardMaterial({ color: 0xc7ccd6, roughness: 0.25, metalness: 0.8 });
+    const sidewallGeo = new THREE.TorusGeometry(radius - 0.004, 0.004, 6, 28);
+    const sidewallMat = new THREE.MeshStandardMaterial({ color: 0x0d0e12, roughness: 0.9 });
+    [-1, 1].forEach(side => {
+      const lip = new THREE.Mesh(lipGeo, lipMat);
+      lip.rotation.x = Math.PI / 2; lip.position.y = side * width * 0.51;
+      wheel.add(lip);
+      const sw = new THREE.Mesh(sidewallGeo, sidewallMat);
+      sw.rotation.x = Math.PI / 2; sw.position.y = side * width * 0.5;
+      wheel.add(sw);
+    });
+
+    const hub = new THREE.Mesh(new THREE.SphereGeometry(0.035, 12, 10),
+      new THREE.MeshStandardMaterial({ color: 0xe6e8ee }));
+    group.add(hub);
+    return { g, group, links, wheel, rim, hub, visualMesh: null };
+  }
+
+  function fitCamera(length, width) {
+    const size = Math.max(length, width, 2);
+    camera.position.set(size * 1.5, size * 0.85, size * 1.7);
+    controls.target.set(-length / 2, 0.25, 0);
+    controls.update();
+  }
+
+  // Interpolate the solved upright pose at a given travel and rack position.
+  function poseAt(g, jounce, rack) {
+    const js = g.jounce, rs = g.rack;
+    const bracket = (axis, value) => {
+      if (axis.length < 2) return [0, 0, 0];
+      let hi = 0; while (hi < axis.length && axis[hi] < value) hi++;
+      if (hi <= 0) return [0, 0, 0];
+      if (hi >= axis.length) return [axis.length - 1, axis.length - 1, 0];
+      const span = axis[hi] - axis[hi - 1];
+      return [hi - 1, hi, span ? (value - axis[hi - 1]) / span : 0];
+    };
+    const [r0, r1, rb] = bracket(rs, rack);
+    const [j0, j1, jb] = bracket(js, jounce);
+    const mix = (table) => {
+      const a = table[r0][j0], b = table[r0][j1];
+      const low = a.map((v, i) => v + (b[i] - v) * jb);
+      if (r0 === r1) return low;
+      const c = table[r1][j0], d = table[r1][j1];
+      const high = c.map((v, i) => v + (d[i] - v) * jb);
+      return low.map((v, i) => v + (high[i] - v) * rb);
+    };
+    return { d: mix(g.pose_d), theta: mix(g.pose_theta) };
+  }
+
+  function rodrigues(theta) {
+    const angle = Math.hypot(theta[0], theta[1], theta[2]);
+    const q = new THREE.Quaternion();
+    if (angle < 1e-12) return q;
+    q.setFromAxisAngle(new THREE.Vector3(theta[0], theta[1], theta[2]).divideScalar(angle), angle);
+    return q;
+  }
+
+  // Rotate an SVJ-frame point about the wheel centre, then translate.
+  function movePoint(p, origin, pose, quaternion) {
+    const v = new THREE.Vector3(p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]);
+    v.applyQuaternion(quaternion);
+    return [origin[0] + pose.d[0] + v.x, origin[1] + pose.d[1] + v.y, origin[2] + pose.d[2] + v.z];
+  }
+
+  // ── glTF visual meshes (SVJ §22) ────────────────────────────────────
+  //
+  // A body's `visual` binding points at a named node inside a shared glTF
+  // asset. The mesh is shown ALONGSIDE the procedural placeholder — never
+  // instead of it — because the point of drawing both is to see where a real
+  // asset and the theoretical geometry the physics actually uses disagree;
+  // swapping one for the other would hide exactly that.
+  //
+  // The fixed rotation `M` below is the same one bodyQuaternion() uses to
+  // convert an SVJ-frame rotation for direct use as a three.js object
+  // transform (three.x=x, three.y=-z, three.z=y — the same axis change
+  // toThree() performs on points). It shows up twice here: once folded into
+  // `assetAxisQuaternion` (converting a mesh's own authored coordinates into
+  // this frame) and once in `conjugateIntoThree` (converting the SAME
+  // rodrigues() rotation `movePoint` already uses on raw SVJ vectors, but for
+  // a case — a whole mesh — where the rotation has to be a THREE object's own
+  // transform rather than something applied to one SVJ-space point at a time).
+  const M_MATRIX = [[1, 0, 0], [0, 0, -1], [0, 1, 0]];
+  const M_QUAT = matrixToQuaternion(M_MATRIX);
+  const M_QUAT_INV = M_QUAT.clone().invert();
+
+  function matrixToQuaternion(rows) {
+    const m4 = new THREE.Matrix4();
+    m4.set(rows[0][0], rows[0][1], rows[0][2], 0, rows[1][0], rows[1][1], rows[1][2], 0,
+          rows[2][0], rows[2][1], rows[2][2], 0, 0, 0, 0, 1);
+    return new THREE.Quaternion().setFromRotationMatrix(m4);
+  }
+
+  // A rotation expressed in SVJ-frame axes (as rodrigues(pose.theta) is),
+  // conjugated for direct assignment to a three.js object's own quaternion —
+  // the M·q·M⁻¹ pattern bodyQuaternion() derives in full (see its comment for
+  // why converting an axis-angle vector's components individually, the naive
+  // approach, is wrong).
+  function conjugateIntoThree(qSvj) {
+    return M_QUAT.clone().multiply(qSvj).multiply(M_QUAT_INV);
+  }
+
+  // The fixed rotation that converts a point already expressed in a glTF
+  // asset's own declared axis convention into the SAME three.js frame
+  // toThree() produces from raw SVJ coordinates — so a mesh authored under
+  // that convention lines up with the SVJ hardpoints it represents.
+  //
+  // Derived from the SAE J670 -> Blender axis table in SVJ_Spec.md §22.4
+  // (+X forward -> -Z, +Y right -> +X, +Z down -> -Y) composed with toThree()
+  // itself; verified against a synthetic test asset built the same way. Only
+  // that one declared convention (Blender's, "up: Y, forward: -Z" — the
+  // spec's own stated default) is handled precisely; anything else declared
+  // falls back to it with a console warning rather than silently guessing at
+  // a general per-axis solver for a case the spec does not fully worked-example.
+  function assetAxisQuaternion(coordinateSystem) {
+    if (!coordinateSystem || typeof coordinateSystem === "string") {
+      // "SAE_J670" (or absent): the asset's own vertices are authored
+      // directly in the physics frame, so the plain SVJ -> three conversion
+      // (M itself) applies, same as any hardpoint.
+      return M_QUAT;
+    }
+    const up = String(coordinateSystem.up || "Y").toUpperCase();
+    const forward = String(coordinateSystem.forward || "-Z").toUpperCase();
+    if (up !== "Y" || forward !== "-Z") {
+      console.warn(`SVJSim: _metadata.coordinate_system {up:"${up}", forward:"${forward}"} ` +
+        'is not the Blender default ("Y", "-Z") this viewer maps precisely; using that ' +
+        "mapping anyway, so this asset's placement should be checked by eye.");
+    }
+    // Composed: three.x=-d.z, three.y=d.y, three.z=d.x.
+    return matrixToQuaternion([[0, 0, -1], [0, 1, 0], [1, 0, 0]]);
+  }
+
+  // Fades a placeholder to a translucent wireframe once a real mesh is shown
+  // for the same body — both stay visible, but the eye reads one as "the
+  // measured reference" and the other as "the actual asset," which is the
+  // point of overlapping them rather than picking one.
+  function ghost(mesh) {
+    if (!mesh) return;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    materials.forEach(mat => {
+      if (!mat || mat.__ghosted) return;
+      mat.__ghosted = true;
+      mat.wireframe = true;
+      mat.transparent = true;
+      mat.opacity = Math.min(mat.opacity ?? 1, 0.4);
+    });
+  }
+
+  const gltfLoader = new THREE.GLTFLoader();
+  const gltfAssetCache = new Map();     // asset id -> Promise<THREE.Object3D>
+
+  function loadGltfAsset(asset) {
+    // Keyed by URL, not the file's own `id` — two different vehicles loaded
+    // in the same session could otherwise reuse each other's `id` string and
+    // collide on a stale cache entry.
+    if (!gltfAssetCache.has(asset.url)) {
+      gltfAssetCache.set(asset.url, new Promise((resolve, reject) => {
+        gltfLoader.load(asset.url, (gltf) => resolve(gltf.scene),
+          undefined, (err) => reject(err));
+      }));
+    }
+    return gltfAssetCache.get(asset.url);
+  }
+
+  // Wraps a cloned glTF node in a fixed-rotation group that lands it in the
+  // same "SVJ point, run through toThree()" space every other piece of
+  // geometry in this viewer already uses — so callers can then move/rotate
+  // that wrapper exactly like they would a procedural mesh's own
+  // position/quaternion (see attachVisualMeshes for the two ways that
+  // happens: fixed for the chassis, per-frame for a wheel station).
+  function wrapVisualNode(node, coordinateSystem) {
+    const axisGroup = new THREE.Group();
+    axisGroup.quaternion.copy(assetAxisQuaternion(coordinateSystem));
+    axisGroup.add(node);
+    return axisGroup;
+  }
+
+  async function attachVisualMeshes(data) {
+    const bindings = data.visual_bindings || [];
+    if (!bindings.length) return;
+    const assetsById = new Map((data.assets || []).map(a => [a.id, a]));
+    const unavailable = new Set();
+
+    for (const binding of bindings) {
+      const asset = assetsById.get(binding.mesh_ref);
+      if (!asset) continue;
+      if (!asset.available) { unavailable.add(asset.id); continue; }
+
+      let scene;
+      try { scene = await loadGltfAsset(asset); }
+      catch (err) {
+        console.warn(`SVJSim: could not load visual asset "${asset.id}" (${asset.url})`, err);
+        continue;
+      }
+      // GLTFLoader sanitizes glTF node names on import (THREE.PropertyBinding
+      // .sanitizeNodeName strips ".:[]/ " so AnimationClip track paths stay
+      // parseable), so SVJ's "SVJ::category::id" convention never survives
+      // load unchanged -- look it up the same way GLTFLoader stored it.
+      const sanitizedName = THREE.PropertyBinding.sanitizeNodeName(binding.node);
+      const node = scene.getObjectByName(binding.node) || scene.getObjectByName(sanitizedName);
+      if (!node) {
+        console.warn(`SVJSim: node "${binding.node}" was not found in asset "${asset.id}"`);
+        continue;
+      }
+      const clone = node.clone(true);
+      const axisGroup = wrapVisualNode(clone, data.coordinate_system);
+
+      if (binding.kind === "chassis") {
+        body.add(axisGroup);
+        ghost(chassisBox); ghost(chassisEdges);
+      } else if (binding.kind === "station") {
+        const station = stations.find(s => s.g.name === binding.station);
+        if (!station) continue;
+        const poseGroup = new THREE.Group();
+        poseGroup.add(axisGroup);
+        station.group.add(poseGroup);
+        station.visualMesh = poseGroup;
+        ghost(station.wheel); ghost(station.rim); ghost(station.hub);
+      } else if (binding.kind === "mass_body" && binding.position) {
+        axisGroup.position.copy(toThree(binding.position));
+        body.add(axisGroup);
+      }
+      // `kind === "other"`: a real binding was found but SVJSim does not yet
+      // know what pose to give it (see find_visual_bindings in server.py) —
+      // left unrendered rather than guessed at.
+    }
+
+    if (unavailable.size) {
+      console.warn("SVJSim: visual mesh file(s) not reachable — " +
+        "open the vehicle via Open/the examples list rather than drag-and-drop " +
+        "so its folder is known:", [...unavailable].join(", "));
+    }
+  }
+
+  // Full SAE 3-2-1 (yaw, pitch, roll) body->inertial rotation, expressed as a
+  // three.js quaternion. Each column of the SVJ rotation matrix is where a
+  // local body axis (X, Y or Z) points in the SVJ inertial frame; converting
+  // each column through the SAME toThree() used for every position in this
+  // file gives that axis in three's frame, and `makeBasis` assembles those
+  // three converted axes into the equivalent three.js rotation directly — so
+  // this is guaranteed consistent with how hardpoints and wheel centres are
+  // already drawn, rather than a separately-derived (and separately
+  // fallible) conversion.
+  function bodyQuaternion(roll, pitch, yaw) {
+    const cr = Math.cos(roll), sr = Math.sin(roll);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    // R_svj: the SAE 3-2-1 body->inertial rotation, exactly matching
+    // svjsim.util.rot_from_euler.
+    const Rsvj = [
+      [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+      [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+      [-sp,     cp * sr,                cp * cr],
+    ];
+    // Converting R_svj's three COLUMNS through toThree() individually — the
+    // first version of this function did that — looks reasonable but is
+    // wrong: `body`'s children (wheels, links, the chassis box) already have
+    // their positions expressed in three-space, via toThree() on their SVJ
+    // coordinates. Rotating those already-converted points the way the real
+    // SVJ rotation would requires conjugating the whole matrix by the
+    // SVJ->three change of basis, R_three = M · R_svj · M⁻¹ — not converting
+    // columns one at a time, which bakes in a spurious ~90° rotation even at
+    // roll = pitch = yaw = 0 (caught from a screenshot showing the car
+    // standing on end). M is the fixed rotation `toThree` performs:
+    // three.x = svj.x, three.y = -svj.z, three.z = svj.y; M is its own
+    // inverse's transpose since it is a pure rotation, so M⁻¹ = Mᵀ.
+    const M = [[1, 0, 0], [0, 0, -1], [0, 1, 0]];
+    const Mt = [[1, 0, 0], [0, 0, 1], [0, -1, 0]];
+    const mul = (A, B) => A.map((row, i) => B[0].map((_, j) =>
+      row.reduce((sum, _v, k) => sum + A[i][k] * B[k][j], 0)));
+    const Rthree = mul(mul(M, Rsvj), Mt);
+    const m = new THREE.Matrix4();
+    m.set(
+      Rthree[0][0], Rthree[0][1], Rthree[0][2], 0,
+      Rthree[1][0], Rthree[1][1], Rthree[1][2], 0,
+      Rthree[2][0], Rthree[2][1], Rthree[2][2], 0,
+      0, 0, 0, 1);
+    return new THREE.Quaternion().setFromRotationMatrix(m);
+  }
+
+  // Forward direction (local +X) in three-space, yaw only — used for the
+  // chase camera so it does not tilt with body roll.
+  function forwardVector(yaw) {
+    return toThree([Math.cos(yaw), Math.sin(yaw), 0]).normalize();
+  }
+
+  function applyBodyPose(pose) {
+    body.quaternion.copy(bodyQuaternion(pose.roll || 0, pose.pitch || 0, pose.yaw || 0));
+    body.position.copy(toThree([pose.x || 0, pose.y || 0, pose.z || 0]));
+  }
+
+  // Moves every station's links/hub/wheel for one operating point.
+  // `jounceOf(name)` and `rack` are the only things that differ between
+  // replaying a recorded maneuver and rendering a live driving frame.
+  function articulateStations(jounceOf, rack) {
+    stations.forEach(s => {
+      const g = s.g;
+      const p = poseAt(g, jounceOf(g.name), g.steered ? rack : 0);
+      const quaternion = rodrigues(p.theta);
+      const origin = g.wheel_center0;
+      const centre = [origin[0] + p.d[0], origin[1] + p.d[1], origin[2] + p.d[2]];
+
+      s.links.forEach(({ spec, lines }) => {
+        const attribute = lines.geometry.attributes.position;
+        const outboard = movePoint(g.hardpoints[spec.outboard], origin, p, quaternion);
+        const out = toThree(outboard);
+        spec.inboard.forEach((pt, i) => {
+          const inb = toThree(pt);
+          attribute.setXYZ(i * 2, inb.x, inb.y, inb.z);
+          attribute.setXYZ(i * 2 + 1, out.x, out.y, out.z);
+        });
+        attribute.needsUpdate = true;
+        lines.geometry.computeBoundingSphere();
+      });
+
+      s.hub.position.copy(toThree(centre));
+      s.wheel.position.copy(toThree(centre));
+      // The wheel spins about the upright's Y axis; a cylinder's axis is +Y in
+      // three, so rotate that onto the transformed spin axis.
+      const axis = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
+      const axisThree = new THREE.Vector3(axis.x, -axis.z, axis.y).normalize();
+      s.wheel.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axisThree);
+
+      if (s.visualMesh) {
+        // A station's mesh node (unlike the procedural hub/wheel, which has
+        // no shape of its own) already sits at wherever its author placed it
+        // in the shared vehicle-frame asset -- often the whole car modeled
+        // together in one file, per real SVJ examples (chassis + all four
+        // uprights sharing corvette_c3.glb). Overwriting that with the
+        // theoretical wheel_center0 position would force every mesh to
+        // coincide with the procedural placeholder by construction, hiding
+        // exactly the kind of hardpoint authoring error this overlay exists
+        // to reveal. So only the INCREMENTAL motion since the design pose
+        // (jounce 0, rack centered) is applied -- the same jounce/steer
+        // delta the procedural geometry itself undergoes -- leaving whatever
+        // absolute offset the asset already has fully visible.
+        const design = poseAt(g, 0, 0);
+        const designQuaternion = rodrigues(design.theta);
+        const deltaPosition = [p.d[0] - design.d[0], p.d[1] - design.d[1], p.d[2] - design.d[2]];
+        const deltaQuaternion = quaternion.clone().multiply(designQuaternion.clone().invert());
+        s.visualMesh.position.copy(toThree(deltaPosition));
+        s.visualMesh.quaternion.copy(conjugateIntoThree(deltaQuaternion));
+      }
+    });
+  }
+
+  function updatePose(frame) {
+    if (!stations.length) return;
+    let jounces = null, pose = { x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0 };
+    if (run && frame !== undefined) {
+      const ch = run.channels;
+      jounces = {};
+      stations.forEach(s => {
+        const j = ch["jounce_" + s.g.name];
+        jounces[s.g.name] = j ? (j[frame] || 0) : 0;
+      });
+      // Playback deliberately keeps the car in place (x=y=yaw=0) even though
+      // the recording has real position/heading — a maneuver's path is shown
+      // in its own 2D chart, and holding the car still here is what lets you
+      // watch the suspension articulate without it driving off past the grid.
+      pose = { x: 0, y: 0, z: (ch.z || [])[frame] || 0,
+               roll: (ch.roll || [])[frame] || 0, pitch: (ch.pitch || [])[frame] || 0, yaw: 0 };
+    }
+    applyBodyPose(pose);
+    const rack = steeringRack(frame);
+    articulateStations(name => jounces ? (jounces[name] || 0) : 0, rack);
+    updateHud(frame);
+  }
+
+  function steeringRack(frame) {
+    if (!run || frame === undefined || !info) return 0;
+    const swa = (run.channels.steering || [])[frame] || 0;
+    const rack = swa / (info.steering_ratio || 15) * (info.rack_per_wheel_angle || 0);
+    const limit = info.max_rack || 0;
+    return Math.max(-limit, Math.min(limit, rack));
+  }
+
+  function updateHud(frame) {
+    if (!run || frame === undefined) {
+      $("viewhud").textContent = S.data ? `${S.data.name} — design attitude` : "—";
+      return;
+    }
+    const ch = run.channels;
+    const at = (k, d = 2) => fmt((ch[k] || [])[frame], d);
+    $("viewhud").innerHTML =
+      `t ${at("time")} s &nbsp; ${at("speed_kph", 1)} km/h<br>` +
+      `ay ${at("ay_g")} g &nbsp; ax ${at("ax_g")} g<br>` +
+      `roll ${fmt(((ch.roll || [])[frame] || 0) * 57.2958)}° &nbsp; ` +
+      `yaw rate ${fmt(((ch.yaw_rate || [])[frame] || 0) * 57.2958, 1)}°/s`;
+  }
+
+  function attachRun(result) {
+    run = result;
+    const frames = (result.channels.time || []).length;
+    if (!frames) { $("playbar").classList.remove("on"); return; }
+    $("playbar").classList.add("on");
+    $("playSlider").max = frames - 1;
+    $("playSlider").value = 0;
+    S.frame = 0;
+    setFrame(0);
+  }
+
+  function setFrame(frame) {
+    S.frame = frame;
+    updatePose(frame);
+    const time = (run && run.channels.time) ? run.channels.time[frame] : 0;
+    $("playtime").textContent = `${fmt(time)} s  ·  frame ${frame + 1}`;
+    $("playSlider").value = frame;
+  }
+
+  // -- driver-in-the-loop --------------------------------------------------
+
+  const chase = { distance: 8, height: 3.2, lookAhead: 4, lookHeight: 1.1 };
+
+  function enterDrive() {
+    run = null; $("playbar").classList.remove("on");
+    controls.enabled = false;
+  }
+
+  function exitDrive() {
+    controls.enabled = true;
+    updatePose();
+  }
+
+  function updateLive(snapshot) {
+    if (!stations.length) return;
+    const [x, y, z] = snapshot.position;
+    const [roll, pitch, yaw] = snapshot.angles;
+    applyBodyPose({ x, y, z, roll, pitch, yaw });
+    articulateStations(name => (snapshot.jounce && snapshot.jounce[name]) || 0,
+      snapshot.rack || 0);
+
+    const carPos = toThree(snapshot.position);
+    const fwd = forwardVector(yaw);
+    const camTarget = carPos.clone().addScaledVector(fwd, -chase.distance);
+    camTarget.y += chase.height;
+    // Smoothed rather than snapped: state arrives over HTTP polling, not a
+    // guaranteed-cadence simulation tick, so a hard follow would judder on
+    // any network hiccup.
+    camera.position.lerp(camTarget, 0.15);
+    const lookAt = carPos.clone().addScaledVector(fwd, chase.lookAhead);
+    lookAt.y += chase.lookHeight;
+    camera.lookAt(lookAt);
+
+    const behind = snapshot.behind_schedule
+      ? ' <span style="color:#e0b341">running behind real time</span>' : "";
+    $("viewhud").innerHTML =
+      `${fmt(snapshot.speed_kph, 1)} km/h &nbsp; gear ${snapshot.gear}` +
+      `${snapshot.auto_shift ? " (auto)" : ""} &nbsp; ${fmt(snapshot.engine_rpm, 0)} rpm<br>` +
+      `ay ${fmt(snapshot.ay_g)} g &nbsp; ax ${fmt(snapshot.ax_g)} g${behind}`;
+  }
+
+  function animate(now) {
+    requestAnimationFrame(animate);
+    // OrbitControls.update() reapplies its own internally stored spherical
+    // position every call regardless of `enabled` — `enabled` only gates
+    // whether mouse/touch input can change that stored state, not whether
+    // update() re-asserts it. Left unconditional, it fights the chase
+    // camera's own manual positioning in updateLive() every single frame.
+    if (controls.enabled) controls.update();
+    if (S.playing && run) {
+      const times = run.channels.time;
+      const rate = parseFloat($("playSpeed").value);
+      const dt = (now - S.lastTick) / 1000 * rate;
+      S.lastTick = now;
+      if (times && times.length > 1) {
+        const step = Math.max(1, Math.round(dt / ((times[1] - times[0]) || 0.02)));
+        let next = S.frame + step;
+        if (next >= times.length) { next = 0; }
+        setFrame(next);
+      }
+    } else { S.lastTick = now; }
+    renderer.render(scene, camera);
+  }
+
+  return { build, attachRun, setFrame, updatePose, updateLive, enterDrive, exitDrive };
+})();
+
+// ── Wiring ───────────────────────────────────────────────────────────
+$("fileBtn").onclick = () => $("fileInput").click();
+$("fileInput").onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => loadDocument(reader.result, file.name);
+  reader.readAsText(file);
+};
+
+["dragenter", "dragover"].forEach(type =>
+  document.addEventListener(type, e => { e.preventDefault(); $("drop").classList.add("on"); }));
+["dragleave", "drop"].forEach(type =>
+  document.addEventListener(type, e => {
+    e.preventDefault();
+    if (type === "dragleave" && e.relatedTarget) return;
+    $("drop").classList.remove("on");
+  }));
+document.addEventListener("drop", e => {
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => loadDocument(reader.result, file.name);
+  reader.readAsText(file);
+});
+
+$("openBtn").onclick = async () => {
+  const path = $("examples").value;
+  if (!path) return;
+  try {
+    applyVehicle(await api("/api/open", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path })
+    }), true);
+    toast("Loaded " + $("examples").selectedOptions[0].textContent);
+  } catch (err) { toast(String(err.message || err), true); }
+};
+
+$("exportBtn").onclick = async () => {
+  const doc = await api("/api/override");
+  const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (S.data.name || "setup").replace(/[^\w.-]+/g, "_") + ".svj-override.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast("Override file downloaded");
+};
+
+$("runBtn").onclick = runTest;
+$("baselineBtn").onclick = () => {
+  S.baseline = S.result;
+  toast("Baseline set — the next run will show the difference");
+  if (S.result) showResult(S.result);
+};
+$("friction").oninput = () => { $("frictionVal").textContent = parseFloat($("friction").value).toFixed(2); };
+$("playBtn").onclick = () => {
+  S.playing = !S.playing;
+  $("playBtn").textContent = S.playing ? "❚❚" : "▶";
+};
+$("playSlider").oninput = () => { S.playing = false; $("playBtn").textContent = "▶"; Viewer.setFrame(parseInt($("playSlider").value, 10)); };
+
+// ── Driving ──────────────────────────────────────────────────────────
+const Drive = {
+  active: false, raf: null, lastFrame: 0,
+  keys: {}, steer: 0,              // smoothed keyboard steering, -1..1
+  gamepadIndex: null,
+};
+
+const DRIVE_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+  "KeyW", "KeyA", "KeyS", "KeyD", "Space", "KeyQ", "KeyE", "KeyR"]);
+
+window.addEventListener("keydown", e => {
+  if (Drive.active && DRIVE_KEYS.has(e.code)) e.preventDefault();
+  Drive.keys[e.code] = true;
+  if (!Drive.active) return;
+  if (e.code === "KeyR") driveReset();
+  else if (e.code === "KeyQ") driveShift(-1);
+  else if (e.code === "KeyE") driveShift(1);
+});
+window.addEventListener("keyup", e => { Drive.keys[e.code] = false; });
+
+window.addEventListener("gamepadconnected", e => {
+  toast(`Gamepad seen: ${e.gamepad.id} — move a stick or press a button to drive with it`);
+});
+window.addEventListener("gamepaddisconnected", e => {
+  if (Drive.gamepadIndex === e.gamepad.index) Drive.gamepadIndex = null;
+  delete Drive.gamepadBaseline[e.gamepad.index];
+});
+
+// Whether a pad has genuinely moved since last checked — NOT whether its
+// axes are simply nonzero. Windows commonly reports an already-paired
+// controller or wheel through the Gamepad API even when nobody is touching
+// it, and some devices rest away from zero on one or more axes; treating any
+// nonzero reading as "in use" would hijack steering from the keyboard the
+// moment such a device is present. Requiring an actual change between frames
+// is immune to a static, even far-from-centre, resting value.
+Drive.gamepadBaseline = {};
+function gamepadMoved(pad) {
+  const previous = Drive.gamepadBaseline[pad.index];
+  Drive.gamepadBaseline[pad.index] = pad.axes.slice();
+  if (!previous) return false;
+  for (let i = 0; i < pad.axes.length; i++) {
+    if (Math.abs(pad.axes[i] - previous[i]) > 0.04) return true;
+  }
+  return pad.buttons.some(b => b && b.pressed);
+}
+
+function keyboardActive() {
+  return !!(Drive.keys.ArrowUp || Drive.keys.KeyW || Drive.keys.ArrowDown || Drive.keys.KeyS ||
+            Drive.keys.ArrowLeft || Drive.keys.KeyA || Drive.keys.ArrowRight || Drive.keys.KeyD ||
+            Drive.keys.Space);
+}
+
+function readKeyboard(dt) {
+  const left = Drive.keys.ArrowLeft || Drive.keys.KeyA;
+  const right = Drive.keys.ArrowRight || Drive.keys.KeyD;
+  const target = (right ? 1 : 0) - (left ? 1 : 0);
+  const rate = (target !== 0 ? 3.5 : 5.5) * dt;    // centring is a bit quicker
+  if (Drive.steer < target) Drive.steer = Math.min(target, Drive.steer + rate);
+  else if (Drive.steer > target) Drive.steer = Math.max(target, Drive.steer - rate);
+  if (Math.abs(Drive.steer) < 0.015) Drive.steer = 0;
+  return {
+    steering: Drive.steer,
+    throttle: (Drive.keys.ArrowUp || Drive.keys.KeyW) ? 1 : 0,
+    brake: (Drive.keys.ArrowDown || Drive.keys.KeyS) ? 1 : 0,
+    handbrake: !!Drive.keys.Space,
+  };
+}
+
+function deadzone(v, dz) { return Math.abs(v) < dz ? 0 : (v - Math.sign(v) * dz) / (1 - dz); }
+
+function readGamepad(pad) {
+  // Standard mapping: left stick X for steering, right/left trigger for
+  // throttle/brake. Wheels recognised as a standard gamepad commonly expose
+  // their rotation on axis 0 too, so this covers both without special-casing.
+  const steering = deadzone(pad.axes[0] || 0, 0.06);
+  const throttle = pad.buttons[7] ? pad.buttons[7].value : 0;
+  const brake = pad.buttons[6] ? pad.buttons[6].value : 0;
+  const handbrake = !!(pad.buttons[0] && pad.buttons[0].pressed);
+  return { steering, throttle, brake, handbrake };
+}
+
+async function driveLoop(now) {
+  if (!Drive.active) return;
+  const dt = Math.min(0.1, (now - (Drive.lastFrame || now)) / 1000);
+  Drive.lastFrame = now;
+
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  let pad = null;
+  if (!keyboardActive()) {
+    // A key held down always wins, so an accidental gamepad takeover can
+    // always be overridden by just typing; otherwise stay on whichever pad
+    // last showed real movement, or look for one that just started moving.
+    pad = (Drive.gamepadIndex != null) ? pads[Drive.gamepadIndex] : null;
+    if (pad) gamepadMoved(pad);        // keep its movement baseline current
+    else {
+      for (const candidate of pads) {
+        if (candidate && gamepadMoved(candidate)) { pad = candidate; Drive.gamepadIndex = candidate.index; break; }
+      }
+    }
+  }
+  const input = pad ? readGamepad(pad) : readKeyboard(dt);
+  $("inputSource").textContent = pad ? (pad.id || "gamepad") : "keyboard";
+  $("driveGamepadDebug").textContent = pad
+    ? `axes ${pad.axes.map(a => a.toFixed(2)).join(", ")}` : "";
+
+  // Fire-and-forget: a slow response must not stall the render loop.
+  api("/api/dil/input", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  }).catch(() => {});
+
+  try {
+    const snapshot = await api("/api/dil/state");
+    if (!snapshot.running) { toast("Driving session ended", true); driveStop(true); return; }
+    Viewer.updateLive(snapshot);
+    $("shiftMode").textContent = snapshot.auto_shift ? "auto" : "manual";
+  } catch (err) { /* a missed frame is not fatal */ }
+
+  if (Drive.active) Drive.raf = requestAnimationFrame(driveLoop);
+}
+
+async function driveStart() {
+  if (!S.data) return;
+  const speed = parseFloat($("driveSpeed").value);
+  const gear = parseInt($("driveGear").value, 10) || 1;
+  const button = $("driveStartBtn");
+  button.disabled = true; button.textContent = "Starting…";
+  try {
+    await api("/api/dil/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ speed_kph: speed, gear }),
+    });
+    Drive.active = true; Drive.steer = 0; Drive.keys = {};
+    Drive.gamepadIndex = null; Drive.gamepadBaseline = {};
+    $("driveStartBtn").style.display = "none";
+    $("driveStopBtn").style.display = "";
+    $("driveStatus").style.display = "";
+    Viewer.enterDrive();
+    Drive.lastFrame = performance.now();
+    Drive.raf = requestAnimationFrame(driveLoop);
+    toast("Driving — WASD or arrow keys, or a connected gamepad");
+  } catch (err) { toast(String(err.message || err), true); }
+  finally { button.disabled = false; button.textContent = "Start driving"; }
+}
+
+async function driveStop(silent) {
+  Drive.active = false;
+  if (Drive.raf) cancelAnimationFrame(Drive.raf);
+  $("driveStartBtn").style.display = "";
+  $("driveStopBtn").style.display = "none";
+  $("driveStatus").style.display = "none";
+  Viewer.exitDrive();
+  try { await api("/api/dil/stop", { method: "POST" }); } catch (err) { /* already gone */ }
+  if (!silent) toast("Stopped driving");
+}
+
+async function driveReset() {
+  try {
+    await api("/api/dil/reset", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ speed_kph: 0, gear: 1 }),
+    });
+  } catch (err) { toast(String(err.message || err), true); }
+}
+
+async function driveShift(delta) {
+  try {
+    await api("/api/dil/shift", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delta }),
+    });
+  } catch (err) { /* not fatal */ }
+}
+
+async function driveSetAuto() {
+  try {
+    await api("/api/dil/input", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manual_gear: null }),
+    });
+  } catch (err) { /* not fatal */ }
+}
+
+$("tabTests").onclick = () => {
+  $("testsTab").style.display = ""; $("driveTab").style.display = "none";
+  $("tabTests").classList.add("active"); $("tabDrive").classList.remove("active");
+};
+$("tabDrive").onclick = () => {
+  $("testsTab").style.display = "none"; $("driveTab").style.display = "";
+  $("tabDrive").classList.add("active"); $("tabTests").classList.remove("active");
+};
+$("driveSpeed").oninput = () => {
+  $("driveSpeedVal").textContent = `${$("driveSpeed").value} km/h`;
+};
+$("driveStartBtn").onclick = driveStart;
+$("driveStopBtn").onclick = () => driveStop(false);
+$("driveResetBtn").onclick = driveReset;
+$("shiftUpBtn").onclick = () => driveShift(1);
+$("shiftDownBtn").onclick = () => driveShift(-1);
+$("autoShiftBtn").onclick = driveSetAuto;
+
+(async function start() {
+  try {
+    const { files } = await api("/api/examples");
+    const select = $("examples");
+    files.forEach(f => select.add(new Option(`${f.folder}/${f.name}`, f.path)));
+    if (!files.length) select.add(new Option("no .svj.json files found nearby", ""));
+  } catch (err) { /* the picker is a convenience, not a requirement */ }
+  try {
+    // The server may have been started with a vehicle already loaded.
+    const session = await api("/api/session");
+    if (session && session.name) applyVehicle(session, true);
+  } catch (err) { /* nothing loaded yet is the normal case */ }
+})();
+</script>
+</body>
+</html>
