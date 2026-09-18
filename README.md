@@ -63,6 +63,17 @@ and draws it alongside the procedural placeholder — the placeholder ghosts to 
 dim wireframe rather than disappearing, so you can see exactly where a real
 mesh and the physics model's own hardpoints agree or don't.
 
+**Tire forces and friction circles, live.** A checkbox over the 3D view draws,
+at each wheel's contact patch, a ring sized to the tire's currently available
+grip, an arrow for the horizontal force it's actually using, and a vertical
+arrow for its load — the arrow reaching the ring *is* the friction-circle
+limit, shown where the force acts rather than on a separate chart, green
+under the limit and red once the tire is actually slipping. The same
+checkbox draws the vehicle's velocity and net force at its centre of
+gravity. Everything is filtered, not raw — real per-step tire-force noise
+would otherwise read as jitter at the frame rate of an arrow. Works
+scrubbing a finished run or driving live.
+
 **Setup edits are SVJ override files.** Moving a slider does not mutate the
 model — it builds an RFC 7396 merge patch (SVJ §3.4), applies it to the base
 document and rebuilds the vehicle from scratch. *Export override* downloads that

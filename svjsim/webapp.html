@@ -75,6 +75,10 @@ aside.right{border-right:none;border-left:1px solid var(--line)}
 #viewhud{position:absolute;left:12px;top:12px;font-size:12px;color:var(--muted);
   background:rgba(15,17,22,.72);border:1px solid var(--line);border-radius:8px;
   padding:8px 11px;pointer-events:none;font-variant-numeric:tabular-nums}
+#viewControls{position:absolute;right:12px;top:12px;font-size:12px;color:var(--muted);
+  background:rgba(15,17,22,.72);border:1px solid var(--line);border-radius:8px;
+  padding:8px 11px}
+#viewControls label{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
 #playbar{position:absolute;left:12px;right:12px;bottom:12px;background:rgba(15,17,22,.9);
   border:1px solid var(--line);border-radius:9px;padding:9px 12px;display:none;
   align-items:center;gap:11px}
@@ -145,6 +149,9 @@ ul.msgs li{margin:4px 0;color:var(--muted);font-size:12px}
     <section id="viewport">
       <div id="three"></div>
       <div id="viewhud">—</div>
+      <div id="viewControls">
+        <label><input type="checkbox" id="showForces"> Forces, friction circles &amp; CG vectors</label>
+      </div>
       <div id="playbar">
         <button id="playBtn">▶</button>
         <input type="range" id="playSlider" min="0" max="100" value="0">
@@ -242,6 +249,7 @@ const S = {
   playing: false,
   frame: 0,
   lastTick: 0,
+  showForces: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -583,9 +591,10 @@ function drawCharts(result) {
 // ── 3D viewer ────────────────────────────────────────────────────────
 const Viewer = (() => {
   let renderer, scene, camera, controls, root, stations = [], body, run = null, info = null;
-  let chassisBox = null, chassisEdges = null;
+  let chassisBox = null, chassisEdges = null, worldGroup = null, gridMesh = null, axisLines = null;
+  let cgVelocityArrow = null, cgForceArrow = null;
   const COLOR = { link: 0x5aa9e6, wheel: 0x2b303a, rim: 0x8e99ad,
-                  chassis: 0x59647a, cg: 0xe0b341 };
+                  chassis: 0x59647a, cg: 0xe0b341, spoke: 0xff4d4d };
 
   // SVJ is X forward, Y right, Z down; three.js is Y up.
   const toThree = (p) => new THREE.Vector3(p[0], -p[2], p[1]);
@@ -606,8 +615,42 @@ const Viewer = (() => {
     scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x20242c, 1.05));
     const key = new THREE.DirectionalLight(0xffffff, 0.75);
     key.position.set(5, 9, 4); scene.add(key);
-    const grid = new THREE.GridHelper(40, 40, 0x2a2f3a, 0x1b1f27);
-    scene.add(grid);
+    // The ground lives in `worldGroup`, not `root`/`body`, so it is fixed to
+    // the world frame and never moves with the car -- but a plain repeating
+    // grid gives the eye nothing to anchor on, so translation/rotation
+    // against it is nearly imperceptible (the same problem a featureless
+    // wheel has for spin, fixed below with a radial marker). Two axis lines
+    // through the world origin, in car-relative colors (forward vs.
+    // lateral), fix that. `worldGroup`'s rotation is what lets maneuver
+    // replay (see updatePose) show the car actually turning and displacing
+    // over the ground: the car itself is still drawn centered at the
+    // origin, and this group carries the car's true recorded yaw inverted,
+    // so the ground visibly turns under it by exactly as much as the car
+    // really turned.
+    //
+    // Position is split between the two children instead of also living on
+    // `worldGroup` itself: `gridMesh` gets the car's true displacement
+    // wrapped to a single grid cell (worldWrap), so a grid that LOOKS
+    // identical at any multiple of its own cell size can visibly slide
+    // under the car forever without either the car outrunning a small fixed
+    // patch or the patch having to be unreasonably (and unnecessarily)
+    // large. `axisLines` gets the true, unwrapped displacement, since the
+    // two axis lines are landmarks at a specific point (the world origin),
+    // not a repeating pattern -- they are only meaningful near that point,
+    // same as they would be in real life.
+    worldGroup = new THREE.Group(); scene.add(worldGroup);
+    gridMesh = new THREE.GridHelper(40, 40, 0x2a2f3a, 0x1b1f27);
+    worldGroup.add(gridMesh);
+    axisLines = new THREE.Group();
+    worldGroup.add(axisLines);
+    const axisMaterial = (color) => new THREE.LineBasicMaterial({ color });
+    const axisLine = (points, color) => {
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      axisLines.add(new THREE.Line(geometry, axisMaterial(color)));
+    };
+    // three.x is SVJ forward, three.z is SVJ right (toThree: x,-z,y swap).
+    axisLine([new THREE.Vector3(-20, 0.002, 0), new THREE.Vector3(20, 0.002, 0)], 0xe0645a);
+    axisLine([new THREE.Vector3(0, 0.002, -20), new THREE.Vector3(0, 0.002, 20)], 0x5aa9e6);
     root = new THREE.Group(); scene.add(root);
     resize(); window.addEventListener("resize", resize);
     animate();
@@ -629,6 +672,7 @@ const Viewer = (() => {
     }
     stations = [];
     chassisBox = null; chassisEdges = null;
+    cgVelocityArrow = null; cgForceArrow = null;
   }
 
   function build(data) {
@@ -663,6 +707,24 @@ const Viewer = (() => {
     const cg = new THREE.Mesh(new THREE.SphereGeometry(0.07, 18, 14),
       new THREE.MeshStandardMaterial({ color: COLOR.cg }));
     cg.position.copy(toThree(data.info.cg)); body.add(cg);
+
+    // Body velocity and net force at the CG, toggled by the same "Tire
+    // forces" checkbox as the per-wheel overlay. Both are children of `body`
+    // and positioned once here (the CG's own position in the body frame
+    // never changes) -- the car's actual roll/pitch/yaw already orients
+    // them correctly frame to frame, the same way it does the wheels.
+    // Body-frame components mean sideslip shows up directly: the velocity
+    // arrow visibly points away from the car's own heading rather than
+    // always pointing straight ahead.
+    const cgPos = toThree(data.info.cg);
+    cgVelocityArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0), cgPos, 0.01, 0x5aa9e6, 0.12, 0.06);
+    cgVelocityArrow.visible = false;
+    body.add(cgVelocityArrow);
+    cgForceArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0), cgPos, 0.01, 0xe0645a, 0.1, 0.055);
+    cgForceArrow.visible = false;
+    body.add(cgForceArrow);
 
     data.geometry.forEach(g => stations.push(buildStation(g)));
     fitCamera(length, width);
@@ -720,7 +782,52 @@ const Viewer = (() => {
     const hub = new THREE.Mesh(new THREE.SphereGeometry(0.035, 12, 10),
       new THREE.MeshStandardMaterial({ color: 0xe6e8ee }));
     group.add(hub);
-    return { g, group, links, wheel, rim, hub, visualMesh: null };
+
+    // A radial spoke from hub to rim, on each face -- a plain cylinder looks
+    // identical at every spin angle, so without a marking there is no way to
+    // see the wheel actually rotating (articulateStations spins `wheel`
+    // about its own axis; this is what makes that visible).
+    const spokeGeo = new THREE.BoxGeometry(radius * 0.88, 0.014, 0.014);
+    spokeGeo.translate(radius * 0.44, 0, 0);
+    const spokeMat = new THREE.MeshStandardMaterial({ color: COLOR.spoke, roughness: 0.5 });
+    [-1, 1].forEach(side => {
+      const spoke = new THREE.Mesh(spokeGeo, spokeMat);
+      spoke.position.y = side * width * 0.52;
+      wheel.add(spoke);
+    });
+
+    // Friction-circle overlay, toggled from the viewport's "Tire forces"
+    // checkbox (see articulateStations): a ring at the tyre's available
+    // grip (mu * Fz) and an arrow for the actual (Fx, Fy) it is currently
+    // using, both in Newtons converted through the same FORCE_SCALE -- so
+    // the arrow tip reaching the ring reads directly as "at the limit,"
+    // right where the force acts, instead of on a separate chart. Built as
+    // a thin unit ring, resized per frame via `scale` rather than rebuilt,
+    // and an ArrowHelper, whose setDirection/setLength update in place.
+    const frictionRing = new THREE.Mesh(
+      new THREE.RingGeometry(0.94, 1.0, 40),
+      new THREE.MeshBasicMaterial({ color: 0x58c08a, side: THREE.DoubleSide,
+        transparent: true, opacity: 0.4, depthWrite: false }));
+    frictionRing.rotation.x = -Math.PI / 2;
+    frictionRing.visible = false;
+    group.add(frictionRing);
+    const forceArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 0.01, 0xff9d3d, 0.06, 0.035);
+    forceArrow.visible = false;
+    group.add(forceArrow);
+    // Vertical load (Fz), same contact point and FORCE_SCALE as the ring and
+    // horizontal arrow, so a glance across all three tells the whole story:
+    // how loaded this corner is, how much grip that buys it, and how much
+    // of that grip it's actually using. Fz is body-frame vertical like
+    // Fx/Fy (solver.py), so unlike `wheel` this needs no camber/steer
+    // rotation -- straight up in `group`'s own (unrotated) local frame is
+    // already straight up in the body frame.
+    const loadArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(0, 1, 0), new THREE.Vector3(), 0.01, 0xc7ccd6, 0.05, 0.03);
+    loadArrow.visible = false;
+    group.add(loadArrow);
+
+    return { g, group, links, wheel, rim, hub, visualMesh: null, frictionRing, forceArrow, loadArrow };
   }
 
   function fitCamera(length, width) {
@@ -995,10 +1102,27 @@ const Viewer = (() => {
     body.position.copy(toThree([pose.x || 0, pose.y || 0, pose.z || 0]));
   }
 
+  // Meters per Newton for the tire-force arrows and friction-circle rings —
+  // fixed rather than derived per vehicle, so a 2500 N static corner load
+  // (a typical road car) draws a ring about one wheel-radius across.
+  const FORCE_SCALE = 1 / 8000;
+  const VELOCITY_SCALE = 0.03;   // meters per m/s, for the CG speed arrow
+  const G = 9.80665;
+  // Time constant of the one-pole low-pass filter applied to every force
+  // channel before it is drawn (see filterChannels/liveFilter below). The
+  // raw per-step tire force has real high-frequency content from contact
+  // patch dynamics that is physically genuine but reads as jitter at the
+  // frame rate of an arrow -- long enough to settle that, short enough to
+  // still track an actual brake or steer transient.
+  const FORCE_FILTER_TAU = 0.06;
+
   // Moves every station's links/hub/wheel for one operating point.
-  // `jounceOf(name)` and `rack` are the only things that differ between
-  // replaying a recorded maneuver and rendering a live driving frame.
-  function articulateStations(jounceOf, rack) {
+  // `jounceOf(name)`, `rack`, `spinOf(name)` and `forcesOf(name)` are the
+  // only things that differ between replaying a recorded maneuver and
+  // rendering a live driving frame. `forcesOf` returns null/undefined to
+  // hide the friction-circle overlay (the viewport checkbox is off, or
+  // there is nothing to show yet).
+  function articulateStations(jounceOf, rack, spinOf, forcesOf) {
     stations.forEach(s => {
       const g = s.g;
       const p = poseAt(g, jounceOf(g.name), g.steered ? rack : 0);
@@ -1025,7 +1149,21 @@ const Viewer = (() => {
       // three, so rotate that onto the transformed spin axis.
       const axis = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
       const axisThree = new THREE.Vector3(axis.x, -axis.z, axis.y).normalize();
-      s.wheel.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axisThree);
+      const align = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), axisThree);
+      // `align` alone has no defined twist about that axis (setFromUnitVectors
+      // gives the minimal rotation between the two vectors), so the roll
+      // angle itself has to be composed in separately: spin about the
+      // wheel's own local Y first, then reorient that axis into place.
+      // `state.spin`'s sign is chosen in solver.py so that spin * r_eff
+      // reads as a forward contact-patch speed (positive = driving
+      // forward) -- it was only ever used as a scalar in the slip-ratio
+      // maths before this viewer existed, never as a literal rotation, so
+      // there was nothing to guarantee that also matches the right-hand
+      // rotation sense about the geometric +Y axis. It doesn't: negated
+      // here, confirmed by eye against a wheel actually rolling forward.
+      const spin = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 1, 0), spinOf ? -spinOf(g.name) : 0);
+      s.wheel.quaternion.copy(align).multiply(spin);
 
       if (s.visualMesh) {
         // A station's mesh node (unlike the procedural hub/wheel, which has
@@ -1047,29 +1185,144 @@ const Viewer = (() => {
         s.visualMesh.position.copy(toThree(deltaPosition));
         s.visualMesh.quaternion.copy(conjugateIntoThree(deltaQuaternion));
       }
+
+      const forces = forcesOf ? forcesOf(g.name) : null;
+      if (forces && forces.grip > 1) {
+        // Fx/Fy/Fz are body-frame (solver.py), the same frame the ring and
+        // load arrow sit in without any camber/steer rotation of their own
+        // -- so the vectors can be converted and dropped straight in.
+        const contact = toThree([centre[0], centre[1], 0]);
+        const forceThree = toThree([forces.Fx, forces.Fy, 0]);
+        const magnitude = forceThree.length();
+
+        s.frictionRing.visible = true;
+        s.frictionRing.position.copy(contact);
+        const gripRadius = Math.max(0.03, forces.grip * FORCE_SCALE);
+        s.frictionRing.scale.set(gripRadius, gripRadius, 1);
+        // Green under the limit, red at and past it (actually slipping) --
+        // a narrow ramp between the two rather than a hard cut, so filtered
+        // but still-noisy data hovering right at the limit doesn't flicker
+        // between the two on single-frame crossings.
+        const GRIP_WARN = 0.92, GRIP_LIMIT = 1.0;
+        const used = magnitude / forces.grip;
+        const t = Math.max(0, Math.min(1, (used - GRIP_WARN) / (GRIP_LIMIT - GRIP_WARN)));
+        s.frictionRing.material.color.setHSL(0.33 * (1 - t), 0.75, 0.5);
+
+        s.forceArrow.visible = magnitude > 1;
+        if (magnitude > 1) {
+          s.forceArrow.position.copy(contact);
+          s.forceArrow.setDirection(forceThree.divideScalar(magnitude));
+          const length = Math.max(0.04, magnitude * FORCE_SCALE);
+          s.forceArrow.setLength(length, Math.min(0.09, length * 0.4), Math.min(0.05, length * 0.28));
+        }
+
+        s.loadArrow.visible = forces.Fz > 1;
+        if (forces.Fz > 1) {
+          s.loadArrow.position.copy(contact);
+          const length = Math.max(0.04, forces.Fz * FORCE_SCALE);
+          s.loadArrow.setLength(length, Math.min(0.08, length * 0.35), Math.min(0.045, length * 0.24));
+        }
+      } else {
+        s.frictionRing.visible = false;
+        s.forceArrow.visible = false;
+        s.loadArrow.visible = false;
+      }
     });
+  }
+
+  // Velocity and net force at the CG, both body-frame like the underlying
+  // channels -- see the comment where the arrows are created in build().
+  // `ax`/`ay` are already the pre-filtered channels by the time this is
+  // called; multiplying by mass turns the (smoothed) acceleration back into
+  // the (smoothed) force that produced it.
+  function updateCgOverlay(vx, vy, ax, ay) {
+    if (!cgVelocityArrow) return;
+    const mass = (info && info.mass_total) || 0;
+
+    const velThree = toThree([vx, vy, 0]);
+    const velMag = velThree.length();
+    cgVelocityArrow.visible = S.showForces && velMag > 0.3;
+    if (cgVelocityArrow.visible) {
+      cgVelocityArrow.setDirection(velThree.divideScalar(velMag));
+      const len = Math.max(0.1, velMag * VELOCITY_SCALE);
+      cgVelocityArrow.setLength(len, Math.min(0.2, len * 0.25), Math.min(0.12, len * 0.18));
+    }
+
+    const forceThree = toThree([ax * mass, ay * mass, 0]);
+    const forceMag = forceThree.length();
+    cgForceArrow.visible = S.showForces && mass > 0 && forceMag > 50;
+    if (cgForceArrow.visible) {
+      cgForceArrow.setDirection(forceThree.divideScalar(forceMag));
+      const len = Math.max(0.08, forceMag * FORCE_SCALE);
+      cgForceArrow.setLength(len, Math.min(0.16, len * 0.3), Math.min(0.09, len * 0.22));
+    }
   }
 
   function updatePose(frame) {
     if (!stations.length) return;
-    let jounces = null, pose = { x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0 };
+    let jounces = null, spins = null, forces = null;
+    let pose = { x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0 };
+    let worldX = 0, worldY = 0, worldYaw = 0;
     if (run && frame !== undefined) {
       const ch = run.channels;
-      jounces = {};
+      jounces = {}; spins = {};
+      if (S.showForces) forces = {};
       stations.forEach(s => {
         const j = ch["jounce_" + s.g.name];
         jounces[s.g.name] = j ? (j[frame] || 0) : 0;
+        const sp = ch["wheelangle_" + s.g.name];
+        spins[s.g.name] = sp ? (sp[frame] || 0) : 0;
+        if (forces) {
+          const name = s.g.name;
+          // Pre-filtered by filterChannels() when the run was attached, not
+          // recomputed here -- see FORCE_FILTER_TAU.
+          forces[name] = {
+            Fx: (ch["Fx_filtered_" + name] || [])[frame] || 0,
+            Fy: (ch["Fy_filtered_" + name] || [])[frame] || 0,
+            Fz: (ch["Fz_filtered_" + name] || [])[frame] || 0,
+            grip: (ch["grip_filtered_" + name] || [])[frame] || 0,
+          };
+        }
       });
-      // Playback deliberately keeps the car in place (x=y=yaw=0) even though
-      // the recording has real position/heading — a maneuver's path is shown
-      // in its own 2D chart, and holding the car still here is what lets you
-      // watch the suspension articulate without it driving off past the grid.
+      worldX = (ch.x || [])[frame] || 0;
+      worldY = (ch.y || [])[frame] || 0;
+      worldYaw = (ch.yaw || [])[frame] || 0;
+      // The car is still held at x=y=0 -- that's what keeps it framed by the
+      // camera instead of driving off a grid that would otherwise have to be
+      // huge -- but its real recorded x/y/yaw is not thrown away: it drives
+      // `worldGroup` below (inverted), so the ground visibly slides and
+      // turns under the car by exactly as much as the car actually moved,
+      // while the car itself still shows its own true heading.
       pose = { x: 0, y: 0, z: (ch.z || [])[frame] || 0,
-               roll: (ch.roll || [])[frame] || 0, pitch: (ch.pitch || [])[frame] || 0, yaw: 0 };
+               roll: (ch.roll || [])[frame] || 0, pitch: (ch.pitch || [])[frame] || 0,
+               yaw: worldYaw };
     }
     applyBodyPose(pose);
+    if (worldGroup) {
+      // Ground-relative-to-car rotation = inverse of the car's own yaw.
+      // Falls out to identity when worldYaw is 0 (the static, no-run view),
+      // so no special case is needed for that.
+      worldGroup.quaternion.copy(bodyQuaternion(0, 0, -worldYaw));
+      // Position is local to worldGroup, so it is expressed BEFORE that
+      // rotation is applied and three.js applies it for us -- see the
+      // comment in init() for why the grid's offset is wrapped to one cell
+      // and the axis lines' is not.
+      const cell = 1;
+      const wrap = (v) => v - cell * Math.round(v / cell);
+      gridMesh.position.copy(toThree([wrap(-worldX), wrap(-worldY), 0]));
+      axisLines.position.copy(toThree([-worldX, -worldY, 0]));
+    }
     const rack = steeringRack(frame);
-    articulateStations(name => jounces ? (jounces[name] || 0) : 0, rack);
+    articulateStations(name => jounces ? (jounces[name] || 0) : 0, rack,
+                        name => spins ? (spins[name] || 0) : 0,
+                        name => forces ? forces[name] : null);
+    if (run && frame !== undefined) {
+      const ch = run.channels;
+      updateCgOverlay((ch.vx || [])[frame] || 0, (ch.vy || [])[frame] || 0,
+        (ch.ax_filtered || [])[frame] || 0, (ch.ay_filtered || [])[frame] || 0);
+    } else {
+      updateCgOverlay(0, 0, 0, 0);
+    }
     updateHud(frame);
   }
 
@@ -1099,11 +1352,79 @@ const Viewer = (() => {
     run = result;
     const frames = (result.channels.time || []).length;
     if (!frames) { $("playbar").classList.remove("on"); return; }
+    integrateSpinAngles(result.channels);
+    filterChannels(result.channels);
     $("playbar").classList.add("on");
     $("playSlider").max = frames - 1;
     $("playSlider").value = 0;
     S.frame = 0;
     setFrame(0);
+  }
+
+  // `spin_<station>` is wheel angular VELOCITY (rad/s) -- the actual physics
+  // state, per solver.py's State layout -- not a rotation angle; the solver
+  // never tracks the angle itself since it has no effect on the dynamics.
+  // Integrating it once here (trapezoidal, over the run's real recorded time
+  // steps) gives a continuous angle for the wheel mesh to spin through,
+  // without redoing the integral on every scrubber move.
+  function integrateSpinAngles(channels) {
+    const time = channels.time;
+    stations.forEach(s => {
+      const speed = channels["spin_" + s.g.name];
+      if (!speed) return;
+      const angle = new Float64Array(speed.length);
+      for (let i = 1; i < speed.length; i++) {
+        angle[i] = angle[i - 1] + 0.5 * (speed[i - 1] + speed[i]) * (time[i] - time[i - 1]);
+      }
+      channels["wheelangle_" + s.g.name] = angle;
+    });
+  }
+
+  // One-pole low-pass, run forward over the recorded (non-uniform) time
+  // steps -- see FORCE_FILTER_TAU. `liveFilter` below is the same filter
+  // applied one sample at a time, for the live-driving case where there is
+  // no future to precompute from.
+  function lowPass(time, raw, tau) {
+    const out = new Float64Array(raw.length);
+    out[0] = raw[0];
+    for (let i = 1; i < raw.length; i++) {
+      const dt = time[i] - time[i - 1];
+      const alpha = dt / (tau + dt);
+      out[i] = out[i - 1] + alpha * (raw[i] - out[i - 1]);
+    }
+    return out;
+  }
+
+  function liveFilter(prev, raw, dt, tau) {
+    if (prev === undefined || dt <= 0) return raw;
+    const alpha = dt / (tau + dt);
+    return prev + alpha * (raw - prev);
+  }
+
+  // Filters every channel the force/friction-circle overlay reads, once per
+  // run, the same way integrateSpinAngles precomputes wheel angle instead of
+  // redoing it on every scrubber move. `grip` (the available friction, not
+  // directly recorded) is derived from Fx/Fy/grip_used *before* filtering,
+  // so the ring and arrow stay consistent with each other frame to frame
+  // instead of each being smoothed from a different underlying signal.
+  function filterChannels(channels) {
+    const time = channels.time;
+    stations.forEach(s => {
+      const name = s.g.name;
+      const fx = channels["Fx_" + name], fy = channels["Fy_" + name], used = channels["grip_used_" + name];
+      if (!fx || !fy || !used) return;
+      const grip = new Float64Array(fx.length);
+      for (let i = 0; i < fx.length; i++) {
+        grip[i] = used[i] > 1e-3 ? Math.hypot(fx[i], fy[i]) / used[i] : 0;
+      }
+      channels["Fx_filtered_" + name] = lowPass(time, fx, FORCE_FILTER_TAU);
+      channels["Fy_filtered_" + name] = lowPass(time, fy, FORCE_FILTER_TAU);
+      channels["grip_filtered_" + name] = lowPass(time, grip, FORCE_FILTER_TAU);
+      const fz = channels["Fz_" + name];
+      if (fz) channels["Fz_filtered_" + name] = lowPass(time, fz, FORCE_FILTER_TAU);
+    });
+    if (channels.ax) channels["ax_filtered"] = lowPass(time, channels.ax, FORCE_FILTER_TAU);
+    if (channels.ay) channels["ay_filtered"] = lowPass(time, channels.ay, FORCE_FILTER_TAU);
   }
 
   function setFrame(frame) {
@@ -1117,10 +1438,27 @@ const Viewer = (() => {
   // -- driver-in-the-loop --------------------------------------------------
 
   const chase = { distance: 8, height: 3.2, lookAhead: 4, lookHeight: 1.1 };
+  // Live driving has no recorded time series to integrate spin speed over up
+  // front (unlike a finished run's channels) -- accumulate it incrementally
+  // instead, one HTTP poll at a time, keyed on the session's own sim clock
+  // rather than wall time so it stays correct if a poll is late.
+  let liveWheelAngle = {}, liveSimTime = null;
+  let liveFilteredForce = {}, liveFilteredAccel = { ax: 0, ay: 0 };
 
   function enterDrive() {
     run = null; $("playbar").classList.remove("on");
     controls.enabled = false;
+    liveWheelAngle = {}; liveSimTime = null;
+    liveFilteredForce = {}; liveFilteredAccel = { ax: 0, ay: 0 };
+    // Live driving moves the car itself through world space and chases it
+    // with the camera (see updateLive) rather than scrolling the ground
+    // under a fixed car -- undo any ground offset a maneuver replay left
+    // behind before switching modes.
+    if (worldGroup) {
+      worldGroup.quaternion.identity();
+      gridMesh.position.set(0, 0, 0);
+      axisLines.position.set(0, 0, 0);
+    }
   }
 
   function exitDrive() {
@@ -1133,8 +1471,50 @@ const Viewer = (() => {
     const [x, y, z] = snapshot.position;
     const [roll, pitch, yaw] = snapshot.angles;
     applyBodyPose({ x, y, z, roll, pitch, yaw });
+
+    // Hold-last-value (rectangular) integration of the polled spin speed —
+    // simple, and plenty accurate at typical poll rates; the chase camera
+    // below already relies on the same "smooth over the polling cadence,
+    // don't chase every jitter" idea via its own lerp.
+    const dt = liveSimTime === null ? 0 : Math.max(0, snapshot.sim_time - liveSimTime);
+    liveSimTime = snapshot.sim_time;
+    if (snapshot.spin) {
+      for (const name in snapshot.spin) {
+        liveWheelAngle[name] = (liveWheelAngle[name] || 0) + snapshot.spin[name] * dt;
+      }
+    }
+    let liveForces = null;
+    if (S.showForces && snapshot.wheels) {
+      liveForces = {};
+      snapshot.wheels.forEach(w => {
+        // Same "recover grip from load_ratio" trick as updatePose, applied
+        // to the live snapshot's per-wheel list instead of run channels.
+        // Filtered the same way and for the same reason as updatePose's
+        // precomputed channels (FORCE_FILTER_TAU) -- one sample at a time
+        // here, via liveFilter, since there is no future run to precompute
+        // from yet.
+        const grip = w.load_ratio > 1e-3 ? Math.hypot(w.Fx || 0, w.Fy || 0) / w.load_ratio : 0;
+        const prev = liveFilteredForce[w.name] || {};
+        const filtered = {
+          Fx: liveFilter(prev.Fx, w.Fx || 0, dt, FORCE_FILTER_TAU),
+          Fy: liveFilter(prev.Fy, w.Fy || 0, dt, FORCE_FILTER_TAU),
+          Fz: liveFilter(prev.Fz, w.Fz || 0, dt, FORCE_FILTER_TAU),
+          grip: liveFilter(prev.grip, grip, dt, FORCE_FILTER_TAU),
+        };
+        liveFilteredForce[w.name] = filtered;
+        liveForces[w.name] = filtered;
+      });
+    }
     articulateStations(name => (snapshot.jounce && snapshot.jounce[name]) || 0,
-      snapshot.rack || 0);
+      snapshot.rack || 0, name => liveWheelAngle[name] || 0,
+      name => liveForces ? liveForces[name] : null);
+
+    if (snapshot.velocity) {
+      liveFilteredAccel.ax = liveFilter(liveFilteredAccel.ax, (snapshot.ax_g || 0) * G, dt, FORCE_FILTER_TAU);
+      liveFilteredAccel.ay = liveFilter(liveFilteredAccel.ay, (snapshot.ay_g || 0) * G, dt, FORCE_FILTER_TAU);
+      updateCgOverlay(snapshot.velocity[0], snapshot.velocity[1],
+                      liveFilteredAccel.ax, liveFilteredAccel.ay);
+    }
 
     const carPos = toThree(snapshot.position);
     const fwd = forwardVector(yaw);
@@ -1437,6 +1817,10 @@ $("tabDrive").onclick = () => {
 };
 $("driveSpeed").oninput = () => {
   $("driveSpeedVal").textContent = `${$("driveSpeed").value} km/h`;
+};
+$("showForces").onchange = () => {
+  S.showForces = $("showForces").checked;
+  Viewer.updatePose(S.frame);   // no-op if no run/vehicle is loaded yet
 };
 $("driveStartBtn").onclick = driveStart;
 $("driveStopBtn").onclick = () => driveStop(false);

@@ -380,6 +380,7 @@ class RealtimeSession:
             "behind_schedule": stats.behind_schedule,
             "position": [round(float(v), 5) for v in state.position],
             "angles": [round(float(v), 6) for v in state.angles],
+            "velocity": [round(float(v), 5) for v in state.velocity],
             "speed_kph": round(float(state.ground_speed) * 3.6, 2),
             "yaw_rate": round(float(state.yaw_rate), 5),
             "sideslip": round(float(state.sideslip), 5),
@@ -390,9 +391,12 @@ class RealtimeSession:
             "auto_shift": self.auto_shift,
             "jounce": {s.name: round(float(state.jounce[i]), 5)
                       for i, s in enumerate(self.vehicle.stations)},
+            "spin": {s.name: round(float(state.spin[i]), 5)
+                    for i, s in enumerate(self.vehicle.stations)},
             "rack": round(self.vehicle.steering.rack_from_wheel(controls.steering), 5),
             "wheels": [{
-                "name": w.name, "Fz": round(w.Fz, 1), "slip_angle": round(w.slip_angle, 5),
+                "name": w.name, "Fx": round(w.Fx, 1), "Fy": round(w.Fy, 1),
+                "Fz": round(w.Fz, 1), "slip_angle": round(w.slip_angle, 5),
                 "slip_ratio": round(w.slip_ratio, 5), "camber": round(w.camber, 5),
                 "steer": round(w.steer, 5), "load_ratio": round(w.load_ratio, 3),
                 "grounded": w.grounded,

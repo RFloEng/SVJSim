@@ -4,6 +4,83 @@
 
 - Prepared the repository for public release: `.gitignore`, a GitHub Actions
   test workflow, `CONTRIBUTING.md`, issue templates, and `svjsim --version`.
+- **Tire force arrows and friction-circle rings are now filtered.** The raw
+  per-step Fx/Fy has real high-frequency content from contact-patch dynamics
+  that is physically genuine but reads as jitter at the frame rate of an
+  arrow. A one-pole low-pass (`FORCE_FILTER_TAU`, 0.06 s) is applied to
+  Fx, Fy and the derived available-grip radius *before* they're drawn —
+  measured as roughly a 3x reduction in frame-to-frame force noise on the
+  Acceleration test's rear wheels. For a finished run this is precomputed
+  once (`filterChannels`, alongside `integrateSpinAngles`); for live driving
+  it's the same filter run one sample at a time (`liveFilter`), since there
+  is no future to precompute from yet.
+- **Speed and net force at the CG.** Same checkbox as the per-wheel overlay,
+  now drawn at the vehicle's centre of gravity too: a blue arrow for the
+  body-frame velocity (so sideslip is directly visible — it points away from
+  the car's own heading during a slide, not always straight ahead) and an
+  orange arrow for the net force (vehicle mass times the filtered
+  acceleration, i.e. what an accelerometer at the CG reads, times mass —
+  not just the sum of tire forces, so it also reflects aero drag and the
+  rest of what `ax`/`ay` already account for).
+- **Vertical load (Fz) drawn at each wheel, and the friction-circle color is
+  now a threshold, not a gradient.** A third arrow per wheel, straight up
+  from the contact patch, sized through the same `FORCE_SCALE` as the
+  horizontal one — so a glance across ring, horizontal arrow and vertical
+  arrow shows how loaded a corner is, how much grip that buys it, and how
+  much of that grip it's using, e.g. front load visibly dropping and rear
+  rising under hard acceleration. The ring itself used to shade continuously
+  from green to red as usage rose, which read as orange-ish most of the
+  time; it's now green under the limit and red at or past it (actually
+  slipping), with only a narrow 92–100% ramp between the two so filtered
+  data sitting right at the limit doesn't flicker.
+- **3D viewer: wheels now actually spin.** `articulateStations` set the
+  wheel's camber/steer tilt but never its roll angle — `setFromUnitVectors`
+  gives the minimal rotation between two vectors, which has no defined twist
+  about the resulting axis, so a wheel's rotation was never applied at all.
+  Composing a separate spin quaternion (rotate about local Y first, then
+  reorient that axis into place) fixes it, but a plain cylinder looks
+  identical at every angle regardless, so a radial marker was added to each
+  wheel to make the rotation visible. The wheel-spin *state* the physics
+  actually tracks is angular velocity, not an angle (there is no rotation
+  state to record — it has no effect on the dynamics), so a maneuver replay
+  integrates the recorded `spin_<station>` channel once when the run loads,
+  and live driving integrates it incrementally per poll, keyed on the
+  session's own sim clock.
+- **3D viewer: the ground plane now has a visible fixed reference.** It was
+  already parented to the scene rather than the car (so it was never
+  literally moving), but a perfectly repeating grid gives the eye nothing to
+  anchor on, so camera/car motion against it was hard to read — the same
+  problem the wheels had. Two colored lines through the world origin
+  (forward/lateral) fix it the same way the wheel spoke does.
+- **Wheel spin was rotating backwards.** `state.spin`'s sign was chosen in
+  `solver.py` purely so `spin * r_eff` reads as a forward contact-patch
+  speed in the slip-ratio maths — before this viewer existed, it was never
+  used as a literal rotation, so nothing had verified it also matched the
+  right-hand rotation sense about the geometric spin axis. It didn't;
+  negated at the one point it becomes a `THREE.Quaternion`.
+- **Maneuver replay now shows the car actually moving.** It still holds the
+  car at the origin (so the camera stays framed on it and the suspension is
+  easy to watch — see the entry above), but that used to mean the ground
+  never appeared to move either, since nothing else in the scene reflected
+  the car's true recorded trajectory. Now the car also carries its real yaw
+  (so you can see it turn), and the ground — both the grid and the two axis
+  lines — carries the inverse of the car's true x/y/yaw, so it visibly
+  slides and turns under the car by exactly as much as the car really moved.
+  The grid's offset is wrapped to a single cell so a patch that looks
+  identical at any multiple of its own size can scroll indefinitely without
+  either the car outrunning it or the grid needing to be unreasonably large;
+  the axis lines use the true, unwrapped offset, since they're a landmark at
+  a specific point, not a repeating pattern.
+- **3D viewer: real-time tire forces and friction circles.** A "Tire forces
+  & friction circle" checkbox over the viewport draws, at each wheel's
+  ground contact point, a ring sized to the tire's currently available grip
+  (`mu * Fz`) and an arrow for the actual (Fx, Fy) force it's using — the
+  arrow tip reaching or crossing the ring is exactly the friction-circle
+  limit, drawn where the force actually acts instead of on a separate chart.
+  Colored green well within the limit, sliding to red at and beyond it.
+  Works both scrubbing a finished run and while driving live; the live path
+  needed `Fx`/`Fy` added to `RealtimeSession.snapshot()`'s per-wheel data,
+  which previously only carried `Fz` and the slip/camber/steer angles.
 
 ## v0.4.0 — glTF visual meshes (SVJ §22)
 
