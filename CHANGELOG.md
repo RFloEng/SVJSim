@@ -1,6 +1,41 @@
 # SVJSim Changelog
 
-## Unreleased
+## v0.5.0 — Axle-level kinematics for beam axles
+
+- **`solid_axle`/`de_dion` beam axles are now properly solved, not
+  approximated.** Previously each side of a rigid axle was solved as an
+  independent, necessarily under-constrained upright (per `BEAM_TOPOLOGIES`'s
+  own docstring), with only camber patched up afterward from a
+  `(jounce_L − jounce_R) / track` small-angle formula — toe was hard-set to
+  static, and roll centre height returned `None` ("not derivable from one
+  wheel"), because neither actually is derivable from one side alone. New
+  `AxleKinematics` (`kinematics.py`) solves the axle as the single rigid body
+  it physically is: six degrees of freedom, two driven directly by each
+  side's own commanded travel, the other four (lateral/longitudinal position,
+  pitch, yaw) from whichever links the file declares — trailing links, a
+  Panhard rod, a Watt's link, a leaf spring — selected for independence the
+  same way an ordinary corner's five are, just four instead of five. Camber
+  and toe fall out for free from the one solved pose (no more small-angle
+  approximation, and bump-steer-through-roll is now real instead of zero),
+  and roll centre height is genuinely computed — a small roll is sampled
+  either side of design and the resulting motion gives the axle's own
+  instantaneous centre of rotation, the whole-axle generalization of the
+  single-corner front-view graphical construction. Verified against the
+  classic hand construction (a Panhard-rod axle's roll centre sits on the
+  rod's own line, at the height it crosses the vehicle centreline) to
+  sub-millimetre precision, and against two real bundled example files
+  (`skeleton_4wd_solid_axle`, `alfa_romeo_75_de_dion`) building and running
+  cleanly with plausible roll-centre numbers. `torsion_beam`, `parallelogram`
+  and `pendulum_axle` aren't covered by this yet, nor is a steered beam axle
+  (no bundled example combines the two, and it would need a genuinely 3D
+  table). `suspension_couplings` (§23.5 — walking beams, equalizer rockers,
+  shared air/hydraulic circuits) is a separate, still-unstarted problem: mass
+  and spring load-sharing *between* axles, not kinematics *within* one.
+- `axle_body.mass` now contributes to unsprung mass (split 50/50 between the
+  axle's two corners) when SVJSim has to estimate unsprung mass itself, per
+  SVJ §9.2.4's "MUST be included" rule — previously ignored entirely, which
+  meant an estimated solid-axle vehicle was silently missing its whole axle
+  housing's worth of unsprung mass (often 100+ kg).
 
 - Prepared the repository for public release: `.gitignore`, a GitHub Actions
   test workflow, `CONTRIBUTING.md`, issue templates, and `svjsim --version`.

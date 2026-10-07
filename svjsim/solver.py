@@ -308,7 +308,15 @@ class VehicleDynamics:
 
         for i, station in enumerate(self.stations):
             j, jdot = float(state.jounce[i]), float(state.jounce_rate[i])
-            p, dp, d2p, sample = self._station_geometry(station, j, rack)
+            # A beam-axle station's `kc` is indexed by (own jounce, partner
+            # jounce) instead of (own jounce, rack) -- see AxleKinematics and
+            # model.py's Station.resolve -- so the axle partner's jounce goes
+            # in the second slot instead of steering rack. Harmless for every
+            # other station: `rack` is what actually belongs there.
+            beam_j = (float(state.jounce[station.beam_partner])
+                      if station.beam_partner is not None else 0.0)
+            second_axis = beam_j if station.beam_partner is not None else rack
+            p, dp, d2p, sample = self._station_geometry(station, j, second_axis)
 
             J_u = np.zeros((3, self.dof))
             J_u[:, 0:3] = np.eye(3)
@@ -325,10 +333,8 @@ class VehicleDynamics:
             bias += mass_u * (J_u.T @ bias_u)
             Q += mass_u * (J_u.T @ gravity_body)
 
-            beam_j = (float(state.jounce[station.beam_partner])
-                      if station.beam_partner is not None else 0.0)
             out = self._wheel_forces(state, station, i, j, jdot, p, dp, R, rack,
-                                     controls, float(drive[i]), sample, beam_j)
+                                     controls, float(drive[i]), sample)
             outputs.append(out)
 
             # Tire force acts at the contact patch, not the hub — that offset is
@@ -397,10 +403,9 @@ class VehicleDynamics:
     def _wheel_forces(self, state: State, station: Station, index: int,
                       jounce: float, jounce_rate: float, p: np.ndarray, dp: np.ndarray,
                       R: np.ndarray, rack: float, controls: Controls,
-                      drive_torque: float, sample: np.ndarray,
-                      partner_jounce: float = 0.0) -> WheelOutput:
+                      drive_torque: float, sample: np.ndarray) -> WheelOutput:
         out = WheelOutput(name=station.name)
-        camber, steer = station.resolve(sample, jounce, partner_jounce)
+        camber, steer = station.resolve(sample)
         out.camber, out.steer = camber, steer
 
         # Wheel spin axis, nominally +Y, tilted by camber then steered.

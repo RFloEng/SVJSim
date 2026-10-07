@@ -29,7 +29,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
-from .kinematics import (KCTable, StationKinematics, from_svj_camber,
+from .kinematics import (AxleKinematics, KCTable, StationKinematics, from_svj_camber,
                          from_svj_toe, side_sign)
 from .tires import TireModel, build_tire
 from .util import (G, Curve, clean, dig, inertia_matrix, num, parallel_axis,
@@ -182,6 +182,7 @@ class Station:
     beam_partner: int | None = None   # index of the station sharing a rigid axle
     beam_track: float = 0.0           # distance between the two wheel centres (m)
     beam_side: float = 1.0            # +1 for the left station, -1 for the right
+    beam_roll_centre_z: float | None = None  # axle's solved roll centre, body-frame Z (m)
     arb_partner: str | None = None
     arb_rate: float = 0.0             # wheel-rate equivalent (N/m)
     static_load: float = 0.0          # vertical load at rest (N)
@@ -201,19 +202,15 @@ class Station:
         """Absolute steer angle: static toe, bump steer and rack input combined."""
         return self.static_toe + self.kc.toe_at(jounce, rack) - self.toe_ref
 
-    def resolve(self, sample: np.ndarray, jounce: float = 0.0,
-                partner_jounce: float = 0.0) -> tuple[float, float]:
+    def resolve(self, sample: np.ndarray) -> tuple[float, float]:
         """Camber and steer from a `KCTable.sample_all` row, avoiding a re-lookup.
 
-        On a rigid beam axle the two wheels are bolted to one body, so their
-        camber is the axle's roll angle and depends on the *difference* between
-        the two wheel travels, not on either one alone. Solving a single station
-        in isolation cannot see that, and reports a large spurious camber gain
-        where the real answer in pure bump is zero.
+        Beam-axle stations need no special case here any more: their `kc` is
+        an `AxleKinematics`-built table already indexed by (own jounce,
+        partner jounce) instead of (own jounce, rack), so `sample` already
+        reflects the axle's actual solved roll — the caller (`solver.py`) is
+        what passes partner jounce in place of rack when it builds `sample`.
         """
-        if self.beam_partner is not None and self.beam_track > 1e-6:
-            roll = self.beam_side * (jounce - partner_jounce) / self.beam_track
-            return self.static_camber + roll, self.static_toe
         return (self.static_camber + float(sample[3]) - self.camber_ref,
                 self.static_toe + float(sample[4]) - self.toe_ref)
 
@@ -234,13 +231,18 @@ class Station:
     def roll_centre_height(self) -> float | None:
         """Roll centre above ground in metres, or None when it is not derivable.
 
-        A beam axle's roll centre is set by its locating linkage — a Panhard
-        rod, Watt's link or the link axes — which is a property of the axle, not
-        of one wheel's travel. Rather than report the number a single-station
-        sweep produces, which would be meaningless, this returns None.
+        A beam axle's roll centre is a property of the whole axle (its
+        locating linkage — Panhard rod, Watt's link, trailing-link axes — not
+        of one wheel's travel), solved once for the axle by `AxleKinematics`
+        at build time (`beam_roll_centre_z`) since that needs both sides'
+        links together. Converting to "height above ground" is deferred to
+        here because tyres aren't built yet when that solve runs.
         """
         if self.is_beam_axle:
-            return None
+            if self.beam_roll_centre_z is None or self.tire is None:
+                return None
+            ground_z = float(self.position0[2]) + self.tire.unloaded_radius
+            return ground_z - self.beam_roll_centre_z
         return self.kc.roll_centre_height(self.tire.unloaded_radius)
 
     def suspension_force(self, jounce: float, jounce_rate: float,
@@ -679,30 +681,39 @@ def _build_powertrain(doc: dict[str, Any], stations: Sequence[Station],
 BEAM_TOPOLOGIES = frozenset({"solid_axle", "de_dion"})
 
 
+def _beam_axle_pairs(names: list[str], suspension: dict[str, Any]) -> dict[int, tuple[str, str]]:
+    """Which station names share a rigid axle, keyed by axle number.
+
+    Single source of truth for "is this a beam axle" pairing, used both to
+    build a coupled `AxleKinematics` solve (in `build_vehicle`, before
+    `Station` objects exist to check track against) and by `_link_beam_axles`
+    below (once they do) to set the `beam_*` bookkeeping fields.
+    """
+    by_axle: dict[int, list[str]] = {}
+    for name in names:
+        topology = str(dig(suspension.get(name, {}), "topology", "system_type", default=""))
+        if topology in BEAM_TOPOLOGIES:
+            by_axle.setdefault(_station_axle(name), []).append(name)
+    return {axle: (members[0], members[1]) for axle, members in by_axle.items()
+            if len(members) == 2}
+
+
 def _link_beam_axles(stations: list[Station], suspension: dict[str, Any],
                      report: BuildReport) -> None:
     """Pair up the two sides of each rigid axle so their camber stays coupled."""
-    by_axle: dict[int, list[int]] = {}
-    for index, station in enumerate(stations):
-        topology = str(dig(suspension.get(station.name, {}), "topology", "system_type",
-                           default=""))
-        if topology in BEAM_TOPOLOGIES:
-            by_axle.setdefault(station.axle, []).append(index)
-
-    for axle, members in by_axle.items():
-        if len(members) != 2:
-            continue
-        a, b = (stations[i] for i in members)
+    index_of = {s.name: i for i, s in enumerate(stations)}
+    for axle, (name_a, name_b) in _beam_axle_pairs([s.name for s in stations], suspension).items():
+        a, b = stations[index_of[name_a]], stations[index_of[name_b]]
         track = abs(float(a.position0[1] - b.position0[1]))
         if track < 1e-6:
             continue
-        a.beam_partner, b.beam_partner = members[1], members[0]
+        a.beam_partner, b.beam_partner = index_of[name_b], index_of[name_a]
         a.beam_track = b.beam_track = track
         a.beam_side = 1.0 if a.side == "L" else -1.0
         b.beam_side = 1.0 if b.side == "L" else -1.0
         report.note(
-            f"axle A{axle} is a rigid beam: its two wheels share one camber angle, taken "
-            f"from the axle's roll rather than from each side's own linkage")
+            f"axle A{axle} is a rigid beam: its two wheels' camber, toe and roll centre "
+            f"come from the axle's own solved kinematics, not from each side's own linkage")
 
 
 def _default_clutch_capacity(engine: Engine | None) -> float:
@@ -777,15 +788,51 @@ def build_vehicle(source: Any, *, prefer_tire: str | None = None,
     # -- first pass: kinematics, so motion ratios are known before springs ----
     solvers: dict[str, StationKinematics] = {}
     tables: dict[str, KCTable] = {}
-    for name in names:
+    axle_roll_centre_z: dict[str, float] = {}
+
+    def _make_solver(name: str) -> tuple[StationKinematics, bool]:
         corner = clean(suspension[name])
         axle_id = f"A{_station_axle(name)}"
         declared_steered = bool(axles.get(axle_id, {}).get("steered"))
         is_front = _station_axle(name) == min(_station_axle(n) for n in names)
         steered = declared_steered or axle_id in extra_steered or \
             (axle_id == primary_axle and is_front and not axles)
-        solver = StationKinematics(name, corner, samples=kc_samples,
-                                   rack_limit=rack_travel if steered else 0.0)
+        return StationKinematics(name, corner, samples=kc_samples,
+                                 rack_limit=rack_travel if steered else 0.0), steered
+
+    beam_pairs = _beam_axle_pairs(names, suspension)
+    paired_with: dict[str, str] = {}
+    for name_a, name_b in beam_pairs.values():
+        paired_with[name_a] = name_b
+        paired_with[name_b] = name_a
+
+    handled: set[str] = set()
+    for name in names:
+        if name in handled:
+            continue
+        partner = paired_with.get(name)
+        if partner is not None:
+            # SVJ doesn't say which of a pair's two data structures "is" the
+            # left one; sort by actual side so AxleKinematics's L/R roles
+            # match the real stations regardless of file/dict order.
+            left_name, right_name = ((name, partner) if _station_side(name) == "L"
+                                     else (partner, name))
+            left_solver, left_steered = _make_solver(left_name)
+            right_solver, right_steered = _make_solver(right_name)
+            if left_steered or right_steered:
+                report.warn(
+                    f"{left_name}/{right_name}: steering on a rigid beam axle is not "
+                    f"simulated yet — treated as unsteered")
+            axle = AxleKinematics(left_solver, right_solver)
+            left_table, right_table, roll_centre_z = axle.build_tables()
+            tables[left_name], tables[right_name] = left_table, right_table
+            solvers[left_name], solvers[right_name] = left_solver, right_solver
+            axle_roll_centre_z[left_name] = axle_roll_centre_z[right_name] = roll_centre_z
+            report.extend(left_solver.warnings + right_solver.warnings + axle.warnings)
+            handled.add(left_name)
+            handled.add(right_name)
+            continue
+        solver, _ = _make_solver(name)
         tables[name] = solver.build_table()
         solvers[name] = solver
         report.extend(solver.warnings)
@@ -801,7 +848,17 @@ def build_vehicle(source: Any, *, prefer_tire: str | None = None,
         unsprung = num(unsprung_spec, name, default=None)
         if unsprung is None:
             unsprung = (num(wheel, "mass", default=None) or 20.0) + 15.0
-            report.estimate(f"{name}: no unsprung mass given — assumed {unsprung:.0f} kg")
+            # SVJ §9.2.4: axle_body.mass "MUST be included (split 50/50) in
+            # mass_unsprung_per_corner" -- a file that already declares its
+            # own mass_unsprung_per_corner is trusted to have done that
+            # itself; this only applies when SVJSim is estimating instead,
+            # so the axle housing isn't silently missing from an estimate.
+            axle_mass = num(corner, "topology", "axle_body", "mass", default=None)
+            if axle_mass:
+                unsprung += axle_mass / 2.0
+            report.estimate(
+                f"{name}: no unsprung mass given — assumed {unsprung:.0f} kg" +
+                (f" (including half the {axle_mass:.0f} kg axle body)" if axle_mass else ""))
 
         spin = num(wheel, "rotational_inertia", default=None)
         if spin is None:
@@ -842,7 +899,8 @@ def build_vehicle(source: Any, *, prefer_tire: str | None = None,
             # while standing still. Left-hand stations evaluate the mirrored
             # tire, which is how the same casing behaves fitted the other way up.
             mirror_tire=_station_side(name) == "L",
-            camber_ref=table.camber_at(0.0, 0.0), toe_ref=table.toe_at(0.0, 0.0)))
+            camber_ref=table.camber_at(0.0, 0.0), toe_ref=table.toe_at(0.0, 0.0),
+            beam_roll_centre_z=axle_roll_centre_z.get(name)))
 
     sprung_mass = total_mass - sum(s.unsprung_mass for s in stations)
     if sprung_mass <= 0:

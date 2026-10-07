@@ -13,7 +13,7 @@ import math
 import numpy as np
 import pytest
 
-from svjsim.kinematics import StationKinematics, to_svj_camber
+from svjsim.kinematics import AxleKinematics, StationKinematics, to_svj_camber
 
 TIRE_RADIUS = 0.32
 
@@ -164,3 +164,101 @@ def test_trailing_arm_uses_revolute_mode_and_holds_camber():
     assert abs(k.table.bump_steer) < 1e-9
     # ...but the wheel does swing fore and aft through its arc.
     assert abs(k.table.recession) > 1e-3
+
+
+# ── Beam axles ───────────────────────────────────────────────────────
+#
+# The reference case here is a solid axle located by a Panhard rod: for
+# infinitesimal roll, the classic hand construction is that the roll centre
+# sits on the rod's own line, at the height where that line crosses the
+# vehicle centreline (y=0) -- the rod is the only thing giving the axle any
+# lateral stiffness, so for a small enough roll its geometry alone decides
+# where the axle can move sideways.
+#
+# The trailing links below give inboard and outboard points the *same* y, so
+# each rod's own axis lies in the X-Z plane with zero y-component -- to first
+# order they add negligible sensitivity to a y-perturbation of the axle, so
+# they locate the axle longitudinally without measurably fighting the
+# Panhard rod for lateral/roll location. That is what lets the classic
+# formula be checked to good precision without solving the whole multi-link
+# mechanism by hand.
+
+TRACK = 1.5
+PANHARD_INBOARD = np.array([0.0, 0.05, -0.30])
+PANHARD_OUTBOARD_Y = -TRACK / 2
+PANHARD_OUTBOARD_Z = -0.40
+
+
+def solid_axle_pair() -> tuple[dict, dict]:
+    def corner(y: float, *, panhard: bool) -> dict:
+        hardpoints = {
+            "wheel_center": [0.0, y, -0.35],
+            "upper_link_end": [0.0, y, -0.45],
+            "lower_link_end": [0.0, y, -0.20],
+        }
+        links = [
+            {"name": "upper_link", "type": "rod",
+             "inboard_points": [[1.0, y, -0.45]], "outboard_ref": "hardpoints.upper_link_end"},
+            {"name": "lower_link", "type": "rod",
+             "inboard_points": [[1.0, y, -0.20]], "outboard_ref": "hardpoints.lower_link_end"},
+        ]
+        if panhard:
+            hardpoints["panhard_axle_end"] = [0.0, PANHARD_OUTBOARD_Y, PANHARD_OUTBOARD_Z]
+            links.append({"name": "panhard_rod", "type": "rod",
+                         "inboard_points": [PANHARD_INBOARD.tolist()],
+                         "outboard_ref": "hardpoints.panhard_axle_end"})
+        return {"topology": {"system_type": "solid_axle",
+                             "upright": {"hardpoints": hardpoints}, "links": links,
+                             "axle_body": {"id": "test_axle"}}}
+
+    return corner(-TRACK / 2, panhard=True), corner(TRACK / 2, panhard=False)
+
+
+def test_axle_roll_centre_matches_panhard_rod_line():
+    left_corner, right_corner = solid_axle_pair()
+    left = StationKinematics("RL", left_corner, samples=5)
+    right = StationKinematics("RR", right_corner, samples=5)
+    axle = AxleKinematics(left, right)
+    # 5 nominal link residuals (upper+lower per side, plus the Panhard rod)
+    # for the 4 the axle actually needs beyond each side's own driven
+    # travel -- one gets dropped as redundant, same as an over-defined
+    # single corner (test_over_constrained_linkage_still_moves).
+    assert len(axle.active) == 4, "4 link residuals expected beyond each side's own travel"
+    assert any("redundant" in w for w in axle.warnings)
+    assert not any("under-located" in w for w in axle.warnings)
+
+    y_in, z_in = PANHARD_INBOARD[1], PANHARD_INBOARD[2]
+    y_out, z_out = PANHARD_OUTBOARD_Y, PANHARD_OUTBOARD_Z
+    slope = (z_out - z_in) / (y_out - y_in)
+    expected = z_in - y_in * slope
+
+    assert axle.roll_centre_z() == pytest.approx(expected, abs=1e-4)
+
+
+def test_axle_camber_shared_and_zero_in_pure_bump():
+    left_corner, right_corner = solid_axle_pair()
+    left = StationKinematics("RL", left_corner, samples=5, travel_limits=(-0.05, 0.05))
+    right = StationKinematics("RR", right_corner, samples=5, travel_limits=(-0.05, 0.05))
+    left_table, right_table, _ = AxleKinematics(left, right).build_tables()
+
+    # Pure bump (both sides travel together): the axle does not roll.
+    assert left_table.camber_at(0.03, 0.03) == pytest.approx(left_table.camber_at(0.0, 0.0), abs=1e-9)
+
+    # Roll (sides travel oppositely): both wheels take the same absolute
+    # camber, since they are rigid extensions of the one solved body.
+    left_camber = left_table.camber_at(0.03, -0.03)
+    right_camber = right_table.camber_at(-0.03, 0.03)
+    assert left_camber == pytest.approx(right_camber, abs=1e-9)
+    assert abs(left_camber) > 1e-3, "a real roll angle should show up as real camber"
+
+
+def test_axle_under_located_without_lateral_device_warns():
+    """Trailing links alone locate the axle longitudinally but not laterally."""
+    left_corner, right_corner = solid_axle_pair()
+    del left_corner["topology"]["links"][-1]  # drop the only lateral device (Panhard rod)
+    del left_corner["topology"]["upright"]["hardpoints"]["panhard_axle_end"]
+    left = StationKinematics("RL", left_corner, samples=5)
+    right = StationKinematics("RR", right_corner, samples=5)
+    axle = AxleKinematics(left, right)
+    assert len(axle.active) < 4
+    assert any("under-located" in w for w in axle.warnings)

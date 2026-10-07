@@ -53,6 +53,11 @@ pip install -e .
 svjsim gui car.svj.json
 ```
 
+On Windows, `start_gui.bat` does both: the first run creates a `.venv` and
+installs SVJSim into it (needs internet and git), after that it just starts the
+app. Drag a `.svj.json` file onto it, or pass one as an argument, to open that
+vehicle straight away.
+
 Opens a local web app: a 3D view of the vehicle built from its own hardpoints, a
 setup panel, the test suite, and telemetry. Drop any `.svj.json` onto the page to
 load it.

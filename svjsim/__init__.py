@@ -16,7 +16,7 @@ from .solver import Controls, Environment, Road, State, VehicleDynamics
 from .telemetry import KPI, Result
 from .tires import TireModel, build_tire
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "build_vehicle", "SimVehicle", "Station",

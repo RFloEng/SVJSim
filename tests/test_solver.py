@@ -209,35 +209,110 @@ def test_the_vehicle_stays_on_the_ground_and_finite(dynamics):
     assert all(w.Fz >= 0 for w in wheels), "a tire can never pull the car down"
 
 
+def _solid_axle_corner(y: float, *, panhard: bool, x: float = -2.60) -> dict:
+    """A real solid-axle corner: trailing links + a Panhard rod on one side.
+
+    The trailing links' inboard and outboard points share the same y, so
+    each rod's own axis has zero y-component and (to first order) adds
+    negligible sensitivity to a y-perturbation of the axle -- they locate it
+    longitudinally without measurably fighting the Panhard rod for lateral
+    location. That is what lets the classic "roll centre sits on the
+    Panhard rod's own line" hand construction be checked against the solver
+    to good precision, the same way test_kinematics.py's
+    test_axle_roll_centre_matches_panhard_rod_line does at the lower level.
+    """
+    hardpoints = {
+        "wheel_center": [x, y, -0.35],
+        "upper_link_end": [x, y, -0.45],
+        "lower_link_end": [x, y, -0.20],
+    }
+    links = [
+        {"name": "upper_link", "type": "rod",
+         "inboard_points": [[x + 1.0, y, -0.45]], "outboard_ref": "hardpoints.upper_link_end"},
+        {"name": "lower_link", "type": "rod",
+         "inboard_points": [[x + 1.0, y, -0.20]], "outboard_ref": "hardpoints.lower_link_end"},
+    ]
+    if panhard:
+        hardpoints["panhard_axle_end"] = [x, -0.775, -0.40]
+        links.append({"name": "panhard_rod", "type": "rod",
+                     "inboard_points": [[x, 0.05, -0.30]],
+                     "outboard_ref": "hardpoints.panhard_axle_end"})
+    return {
+        "topology": {"system_type": "solid_axle", "upright": {"hardpoints": hardpoints},
+                     "links": links, "axle_body": {"id": "rear_axle", "mass": 70.0,
+                                                    "position": [x, 0.0, -0.32]}},
+        "wheel": {"rim_diameter": 0.4318, "rim_width": 0.1905, "mass": 21.0,
+                  "rotational_inertia": 0.85, "set_ref": "road_225_45r17"},
+        "spring": {"type": "coil", "rate": 30000.0, "motion_ratio": 0.75,
+                   "inboard_mount": [x, y * 0.4, -0.60], "outboard_mount": [x, y, -0.20]},
+        "damper": {"type": "monotube", "motion_ratio": 0.75,
+                   "bump_curve": [[0.0, 0.0], [0.1, 220.0], [0.5, 700.0]],
+                   "rebound_curve": [[0.0, 0.0], [0.1, 320.0], [0.5, 1000.0]],
+                   "inboard_mount": [x, y * 0.4, -0.60], "outboard_mount": [x, y, -0.20]},
+        "alignment": {"camber": 0.0, "toe": 0.0},
+        "bump_stop": {"gap": 0.06, "rate": 250000.0},
+        "rebound_stop": {"gap": 0.07, "rate": 60000.0},
+        "brake": {
+            "disc": {"type": "vented", "outer_diameter": 0.30, "inner_diameter": 0.20,
+                     "effective_radius": 0.128, "mass": 7.0, "specific_heat": 460.0,
+                     "rotational_inertia": 0.10},
+            "caliper": {"type": "fixed", "pistons": 4, "piston_area_total": 0.0032},
+            "pad": {"material": "semi_metallic", "mu_cold": 0.40},
+        },
+        "tire": {"set_ref": "road_225_45r17", "pressure": 230000.0},
+    }
+
+
 def test_beam_axle_camber_follows_axle_roll_not_wheel_travel(document):
     """A rigid axle cannot camber one wheel without rolling the whole axle."""
     from svjsim.model import build_vehicle
 
-    for name in ("RL", "RR"):
-        corner = document["suspension"][name]
-        corner["topology"]["system_type"] = "solid_axle"
-        corner["topology"]["axle_body"] = {"id": "rear_axle", "mass": 70.0,
-                                           "position": [-2.60, 0.0, -0.32]}
+    document["suspension"]["RL"] = _solid_axle_corner(-0.775, panhard=True)
+    document["suspension"]["RR"] = _solid_axle_corner(0.775, panhard=False)
     vehicle = build_vehicle(document)
     left = vehicle.station("RL")
     right = vehicle.station("RR")
     assert left.is_beam_axle and right.is_beam_axle
     assert left.camber_gain == 0.0, "pure bump must not camber a beam axle"
-    assert left.roll_centre_height() is None, "not derivable from one wheel"
 
-    sample = left.kc.sample_all(0.0, 0.0)
-    # Both wheels rising together: the axle stays level.
-    camber_bump, _ = left.resolve(sample, 0.03, 0.03)
-    assert camber_bump == pytest.approx(left.static_camber, abs=1e-9)
+    # Now genuinely solved, from both sides' links and the Panhard rod
+    # together -- not the None the old single-station-only version returned.
+    rc = left.roll_centre_height()
+    assert rc is not None
+    # Hand construction: the classic Panhard-rod roll centre sits on the
+    # rod's own line, at the height where it crosses the vehicle centreline.
+    y_in, z_in, y_out, z_out = 0.05, -0.30, -0.775, -0.40
+    slope = (z_out - z_in) / (y_out - y_in)
+    expected_z = z_in - y_in * slope                      # body-frame Z
+    ground_z = float(left.position0[2]) + left.tire.unloaded_radius
+    assert rc == pytest.approx(ground_z - expected_z, abs=2e-3)
+    assert right.roll_centre_height() == pytest.approx(rc, abs=1e-6), \
+        "one roll centre for the whole axle, not one per side"
 
-    # One wheel up and the other down by the same amount: the axle rolls, and
-    # both wheels take that same angle.
-    camber_roll, _ = left.resolve(sample, 0.03, -0.03)
-    expected = left.static_camber + 0.06 / left.beam_track
-    assert camber_roll == pytest.approx(expected, rel=1e-9)
-    camber_other, _ = right.resolve(right.kc.sample_all(0.0, 0.0), -0.03, 0.03)
-    assert camber_other - right.static_camber == pytest.approx(
-        camber_roll - left.static_camber, rel=1e-9)
+    # Both wheels rising together (pure bump): the axle does not roll.
+    sample_bump = left.kc.sample_all(0.03, 0.03)
+    camber_bump, _ = left.resolve(sample_bump)
+    assert camber_bump == pytest.approx(left.static_camber, abs=1e-6)
+
+    # One wheel up and the other down by the same amount (roll): both wheels
+    # take the same absolute camber, since they are rigid extensions of the
+    # one solved axle body -- this is now read straight from the table
+    # (second axis = partner jounce, per Station.resolve's docstring), not
+    # approximated from a `(jL - jR) / track` formula.
+    camber_roll, _ = left.resolve(left.kc.sample_all(0.03, -0.03))
+    camber_other, _ = right.resolve(right.kc.sample_all(-0.03, 0.03))
+    assert camber_roll != pytest.approx(left.static_camber, abs=1e-4), \
+        "a real roll angle should show up as real camber"
+    assert camber_other == pytest.approx(camber_roll, abs=1e-6)
+
+    # The vehicle still simulates: a beam axle's coupled solve must not make
+    # the dynamics blow up.
+    dynamics = VehicleDynamics(vehicle)
+    state = dynamics.trim(speed=20.0, gear=2, duration=1.0)
+    controls = Controls(throttle=0.3, gear=2, clutch=1.0)
+    for _ in range(200):
+        state = step_rk4(dynamics, state, controls, 0.002)
+        assert np.all(np.isfinite(state.data))
 
 
 def test_lateral_grip_is_bounded_by_the_tire(dynamics):

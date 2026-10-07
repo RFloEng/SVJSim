@@ -196,8 +196,10 @@ def _vehicle_section(vehicle: SimVehicle) -> str:
 <tbody>{''.join(rows)}</tbody></table>
 <p class="note">Camber is shown in SVJ's relative-to-centreline sign, where negative leans
 the wheel top inboard. Roll centre height is derived from the solved contact-patch path,
-not read from the file. A rigid beam axle shows no camber gain in bump and no roll centre,
-because both are properties of the axle rather than of one wheel's travel.</p>
+not read from the file. A rigid beam axle shows no camber gain in bump, because pure bump
+does not roll the axle; its roll centre is still shown, solved from both sides' links and
+locating linkage (Panhard rod, Watt's link...) together rather than from one wheel's own
+travel.</p>
 </div>
 <h2>Where this model came from</h2>
 <div class="panel">

@@ -367,48 +367,24 @@ class StationKinematics:
         keep whatever they have; the remaining freedoms resolve to the pose
         closest to design.
         """
-        labels: list[tuple[int, int]] = [
-            (li, ci) for li, link in enumerate(self.links)
-            for ci in range(len(link.residuals(UprightPose.identity(self.wheel_center0), 0.0)))
-        ]
-        if not labels:
-            return
-        pose0 = UprightPose.identity(self.wheel_center0)
-        base = self._all_residuals(pose0, 0.0)
-        J = _numeric_jacobian(
-            lambda v: self._all_residuals(UprightPose(v[:3], v[3:], self.wheel_center0), 0.0),
-            np.zeros(6), base)
-
-        # Greedy Gram-Schmidt: repeatedly take the constraint with the largest
-        # component orthogonal to everything already selected.
-        chosen: list[int] = []
-        basis: list[np.ndarray] = []
-        remaining = list(range(len(labels)))
-        while remaining and len(chosen) < 5:
-            best_i, best_res, best_vec = None, 0.0, None
-            for i in remaining:
-                v = J[i].astype(float)
-                for b in basis:
-                    v = v - float(v @ b) * b
-                norm = float(np.linalg.norm(v))
-                if norm > best_res:
-                    best_i, best_res, best_vec = i, norm, v
-            if best_i is None or best_res < 1e-6 * max(1.0, float(np.linalg.norm(J))):
-                break
-            chosen.append(best_i)
-            basis.append(best_vec / best_res)
-            remaining.remove(best_i)
-
-        self.active = [labels[i] for i in chosen]
-        if remaining:
-            dropped = sorted({self.links[labels[i][0]].name for i in remaining})
+        active, dropped = _select_independent_constraints(self.links, self.wheel_center0, target=5)
+        self.active = active
+        total = len(active) + len(dropped)
+        if dropped:
+            names = sorted({self.links[li].name for li, _ in dropped})
             self.warnings.append(
-                f"{self.station}: {len(labels)} link constraints for a 5-constraint linkage — "
-                f"redundant ones on {', '.join(dropped)} dropped. The topology is "
+                f"{self.station}: {total} link constraints for a 5-constraint linkage — "
+                f"redundant ones on {', '.join(names)} dropped. The topology is "
                 f"over-defined; a true multi-link wants `rod` links, not `arm` links")
-        elif len(chosen) < 5 and self.topology not in BEAM_TOPOLOGIES:
+        # Independent from the above, not `elif`: dropping constraints as
+        # redundant (just above) and coming up short of 5 independent ones
+        # (here) are different failures that can happen together — e.g. two
+        # declared constraints that are individually fine but geometrically
+        # near-parallel neither adds new information (dropped as "redundant")
+        # nor between them locates the direction they both happen to miss.
+        if len(active) < 5 and self.topology not in BEAM_TOPOLOGIES:
             self.warnings.append(
-                f"{self.station}: only {len(chosen)} independent link constraints "
+                f"{self.station}: only {len(active)} independent link constraints "
                 f"(5 expected) — the upright is under-located and free directions "
                 f"are held at their design values")
 
@@ -675,6 +651,54 @@ def _numeric_jacobian(fn, x: np.ndarray, f0: np.ndarray, eps: float = 1e-7) -> n
     return J
 
 
+def _select_independent_constraints(
+    links: list[Link], origin: np.ndarray, target: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Greedy Gram-Schmidt pick of up to `target` independent link residuals.
+
+    Shared by `StationKinematics` (one upright, five freedoms free once travel
+    is driven) and `AxleKinematics` (one rigid beam, four freedoms free once
+    both sides' travel is driven) — the same "rank the constraint Jacobian,
+    keep what actually adds a new direction" idea, just against a different
+    rigid body and a different target count. Returns (active, dropped), each
+    a list of (link index into `links`, residual-component index).
+    """
+    labels: list[tuple[int, int]] = [
+        (li, ci) for li, link in enumerate(links)
+        for ci in range(len(link.residuals(UprightPose.identity(origin), 0.0)))
+    ]
+    if not labels:
+        return [], []
+    pose0 = UprightPose.identity(origin)
+    all_residuals = (lambda pose: np.concatenate([l.residuals(pose, 0.0) for l in links])
+                     if links else np.zeros(0))
+    base = all_residuals(pose0)
+    J = _numeric_jacobian(
+        lambda v: all_residuals(UprightPose(v[:3], v[3:], origin)), np.zeros(6), base)
+
+    # Repeatedly take the constraint with the largest component orthogonal to
+    # everything already selected.
+    chosen: list[int] = []
+    basis: list[np.ndarray] = []
+    remaining = list(range(len(labels)))
+    while remaining and len(chosen) < target:
+        best_i, best_res, best_vec = None, 0.0, None
+        for i in remaining:
+            v = J[i].astype(float)
+            for b in basis:
+                v = v - float(v @ b) * b
+            norm = float(np.linalg.norm(v))
+            if norm > best_res:
+                best_i, best_res, best_vec = i, norm, v
+        if best_i is None or best_res < 1e-6 * max(1.0, float(np.linalg.norm(J))):
+            break
+        chosen.append(best_i)
+        basis.append(best_vec / best_res)
+        remaining.remove(best_i)
+
+    return [labels[i] for i in chosen], [labels[i] for i in remaining]
+
+
 # ── Tabulated result ──────────────────────────────────────────────────
 
 class KCTable:
@@ -875,3 +899,212 @@ class KCTable:
         """
         cp = self.contact_patch(radius)
         return float(self.contact_jacobian(radius)[1] * cp[1])
+
+
+# ── Beam axles ───────────────────────────────────────────────────────
+
+@dataclass
+class _AxleTableView:
+    """Duck-types the `StationKinematics` attributes `KCTable.__init__` reads.
+
+    `rack_grid` is repurposed to the axle partner's jounce sweep instead of
+    steering rack (no bundled example combines a steered axle with a rigid
+    beam, and a steered beam axle would need a genuinely 3D table — jounce,
+    partner jounce, rack together — which is out of scope here). Everything
+    downstream that reads a station's `KCTable` (the solver, the report, the
+    GUI) stays unaware anything is different.
+    """
+
+    station: str
+    topology: str
+    steered: bool
+    wheel_center0: np.ndarray
+    jounce_grid: np.ndarray
+    rack_grid: np.ndarray
+
+
+class AxleKinematics:
+    """Solves the shared rigid pose of a beam axle from both corners' links
+    together, instead of the two independent, necessarily under-constrained
+    per-side solves a plain `StationKinematics` gives a `solid_axle`/`de_dion`
+    corner on its own (see `BEAM_TOPOLOGIES`).
+
+    The axle is one rigid body with six freedoms. Two are driven directly —
+    each side's own commanded jounce, i.e. its wheel-centre height — the same
+    way a single corner's travel drives one of its own six. The other four —
+    lateral and longitudinal position, pitch, yaw — come from whichever links
+    the file actually declares (trailing links, a Panhard rod or Watt's link,
+    a leaf spring...), selected the same way an ordinary corner's five freedoms
+    are (`_select_independent_constraints`), just four instead of five since
+    two are already spoken for.
+
+    Camber and toe fall out for free: both wheels are rigid extensions of the
+    same solved body, so their absolute orientation *is* the axle's, exactly
+    matching the spec's "zero camber change, zero toe change [relative to the
+    axle]" for `solid_axle`/`de_dion` — no separate per-side link solve, and
+    no small-angle approximation the way the old camber-from-roll shortcut in
+    `Station.resolve` needed (that shortcut is gone; see `model.py`).
+    """
+
+    def __init__(self, left: "StationKinematics", right: "StationKinematics"):
+        self.left, self.right = left, right
+        self.links = list(left.links) + list(right.links)
+        self.origin = (left.wheel_center0 + right.wheel_center0) / 2.0
+        self.warnings: list[str] = []
+        active, dropped = _select_independent_constraints(self.links, self.origin, target=4)
+        self.active = active
+        label = f"{left.station}/{right.station}"
+        total = len(active) + len(dropped)
+        if dropped:
+            names = sorted({self.links[li].name for li, _ in dropped})
+            self.warnings.append(
+                f"{label} axle: {total} link constraints for a 4-constraint axle "
+                f"(six freedoms, two already driven by each side's own travel) — "
+                f"redundant ones on {', '.join(names)} dropped")
+        # Independent from the above, not `elif` -- see the matching comment
+        # in StationKinematics._select_constraints: a set of constraints can
+        # be simultaneously "some declared ones add nothing new" and "still
+        # short of four genuinely independent directions," e.g. two
+        # trailing links that are individually fine but too close to
+        # parallel to give the axle any real lateral location between them.
+        if len(active) < 4:
+            self.warnings.append(
+                f"{label} axle: only {len(active)} independent link constraints "
+                f"(4 expected) beyond each side's own driven travel — the axle is "
+                f"under-located and free directions are held at their design values")
+
+    def solve(self, jounce_left: float, jounce_right: float,
+             guess: UprightPose | None = None) -> tuple[UprightPose, float]:
+        """Solve the axle's rigid pose at the two sides' wheel travel.
+
+        Same damped-least-squares Newton loop as `StationKinematics._solve_links`,
+        just with two driving constraints (one per side's commanded jounce)
+        against the shared six-DOF pose instead of one against a single
+        upright's.
+        """
+        pose = UprightPose(
+            d=np.array(guess.d, copy=True) if guess else np.zeros(3),
+            theta=np.array(guess.theta, copy=True) if guess else np.zeros(3),
+            origin=self.origin,
+        )
+        x = np.concatenate([pose.d, pose.theta])
+
+        def residual(v: np.ndarray) -> np.ndarray:
+            p = UprightPose(v[:3], v[3:], self.origin)
+            per_link = [link.residuals(p, 0.0) for link in self.links]
+            active = [per_link[li][ci] for li, ci in self.active]
+            active.append(float(p.transform(self.left.wheel_center0)[2])
+                          - (self.left.wheel_center0[2] - jounce_left))
+            active.append(float(p.transform(self.right.wheel_center0)[2])
+                          - (self.right.wheel_center0[2] - jounce_right))
+            return np.asarray(active)
+
+        for _ in range(60):
+            r = residual(x)
+            err = float(np.max(np.abs(r)))
+            if err < 1e-10:
+                break
+            J = _numeric_jacobian(residual, x, r)
+            lam = 1e-9
+            JtJ = J.T @ J + lam * np.eye(J.shape[1])
+            step = np.linalg.solve(JtJ, J.T @ r)
+            scale = 1.0
+            for _ in range(20):
+                trial = x - scale * step
+                if float(np.max(np.abs(residual(trial)))) < err:
+                    break
+                scale *= 0.5
+            else:
+                break
+            x = x - scale * step
+
+        pose = UprightPose(x[:3], x[3:], self.origin)
+        return pose, float(np.max(np.abs(residual(x))))
+
+    def _sample_side(self, side: "StationKinematics", pose: UprightPose,
+                     own_jounce: float, partner_jounce: float, residual: float) -> KCSample:
+        wc = pose.transform(side.wheel_center0)
+        axis = pose.spin_axis()
+        camber = float(np.arcsin(np.clip(axis[2], -1.0, 1.0)))
+        toe = float(np.arctan2(-axis[0], axis[1]))
+        full = (np.concatenate([l.residuals(pose, 0.0) for l in self.links])
+               if self.links else np.zeros(0))
+        geometry_error = float(np.max(np.abs(full))) if full.size else 0.0
+        return KCSample(
+            jounce=own_jounce, rack=partner_jounce, wheel_center=wc, camber=camber, toe=toe,
+            spring_length=side._element_length(side.spring_mounts, pose, 0.0),
+            damper_length=side._element_length(side.damper_mounts, pose, 0.0),
+            arb_travel=side._arb_travel(pose, 0.0),
+            residual=residual, geometry_error=geometry_error,
+            pose_d=np.array(pose.d, copy=True), pose_theta=np.array(pose.theta, copy=True))
+
+    def build_tables(self) -> tuple[KCTable, KCTable, float]:
+        """Sweep both sides' travel together and tabulate each side's result.
+
+        Returns `(left_table, right_table, roll_centre_z)` — the two tables
+        read exactly like an ordinary corner's (see `_AxleTableView`), and
+        `roll_centre_z` is the axle's own roll-centre height (`roll_centre_height`
+        below) in raw body-frame Z, for `model.py` to convert to "above ground"
+        once tyre radius is known (kinematics is solved before tyres are built).
+        """
+        left_grid, right_grid = self.left.jounce_grid, self.right.jounce_grid
+        poses: list[list[UprightPose]] = [[None] * len(left_grid) for _ in right_grid]  # type: ignore[list-item]
+        residuals: list[list[float]] = [[0.0] * len(left_grid) for _ in right_grid]
+        guess: UprightPose | None = None
+        for ri in range(len(right_grid)):
+            for li in range(len(left_grid)):
+                pose, residual = self.solve(float(left_grid[li]), float(right_grid[ri]), guess)
+                guess = pose
+                poses[ri][li] = pose
+                residuals[ri][li] = residual
+
+        left_rows = [[self._sample_side(self.left, poses[ri][li],
+                                        float(left_grid[li]), float(right_grid[ri]), residuals[ri][li])
+                     for li in range(len(left_grid))] for ri in range(len(right_grid))]
+        right_rows = [[self._sample_side(self.right, poses[ri][li],
+                                         float(right_grid[ri]), float(left_grid[li]), residuals[ri][li])
+                      for ri in range(len(right_grid))] for li in range(len(left_grid))]
+
+        left_table = KCTable(_AxleTableView(self.left.station, self.left.topology, False,
+                                            self.left.wheel_center0, left_grid, right_grid),
+                             left_rows)
+        right_table = KCTable(_AxleTableView(self.right.station, self.right.topology, False,
+                                             self.right.wheel_center0, right_grid, left_grid),
+                              right_rows)
+        return left_table, right_table, self.roll_centre_z()
+
+    def roll_centre_z(self, h: float = 1e-4) -> float:
+        """Body-frame Z of the axle's kinematic roll centre.
+
+        Generalizes the front-view graphical construction `KCTable.roll_centre_height`
+        uses for one corner — draw a line through the instant centre of the
+        wheel's motion and read where it crosses the centreline — to the whole
+        axle: sample a small roll either side of design (one side up, the other
+        down by the same amount, the only direction the two sides move
+        oppositely — see `Station.resolve`'s old `(jL-jR)/track` formula this
+        replaces) and find the instantaneous centre of the resulting planar
+        (Y-Z) rigid-body motion of a point fixed to the axle.
+
+        The finite-difference step is on the *travel* the two sides are driven
+        with, not on an assumed roll angle — the actual roll rate is measured
+        from the solved poses' own rotation, the same rotation machinery
+        `bodyQuaternion`/`UprightPose` use everywhere else, so a sign or scale
+        mistake in what "roll" means can't sneak in here independently of what
+        the rest of the solve already agrees it means.
+        """
+        track = abs(float(self.left.wheel_center0[1] - self.right.wheel_center0[1]))
+        if track < 1e-6:
+            return float(self.origin[2])
+        dj = 0.5 * h * track
+        pose_plus, _ = self.solve(dj, -dj)
+        pose_minus, _ = self.solve(-dj, dj)
+        omega = float((pose_plus.theta[0] - pose_minus.theta[0]) / (2 * h))
+        if abs(omega) < 1e-9:
+            return float(self.origin[2])
+        p_plus = pose_plus.transform(self.origin)
+        p_minus = pose_minus.transform(self.origin)
+        v = (p_plus - p_minus) / (2 * h)
+        # Planar instant-centre of a body rotating at rate `omega` about the
+        # SVJ +X axis, reference point `origin` moving at velocity `v` in the
+        # Y-Z plane: v = omega * x_hat x (origin - centre), inverted for centre.
+        return float(self.origin[2]) + float(v[1]) / omega

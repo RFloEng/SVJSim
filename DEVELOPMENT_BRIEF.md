@@ -1,10 +1,11 @@
 # SVJSim — Development Brief
 
-For anyone extending this. Current state is **v0.4.0**: the physics core, the
-automated test bench, the local web app, driver-in-the-loop, and glTF visual
-mesh binding (SVJ §22) all work and are validated against a real car. This
-covers the architecture, the decisions that are load-bearing, and what is
-worth doing next.
+For anyone extending this. Current state is **v0.5.0**: the physics core, the
+automated test bench, the local web app, driver-in-the-loop, glTF visual mesh
+binding (SVJ §22), and axle-level kinematics for solid-axle/de-Dion beam
+axles all work and are validated against a real car. This covers the
+architecture, the decisions that are load-bearing, and what is worth doing
+next.
 
 ## 1. Scope
 
@@ -138,7 +139,7 @@ roll-centre heights or anti-percentages anywhere in the code.
 | To add | Where | Notes |
 |---|---|---|
 | A tire model | `tires.py` | Subclass `TireModel`, implement `forces()`, register in `build_tire` |
-| A suspension topology | `kinematics.py` | Add link constraints, or add to `CARRIER_TOPOLOGIES` / `BEAM_TOPOLOGIES` |
+| A suspension topology | `kinematics.py` | Add link constraints, or add to `CARRIER_TOPOLOGIES` / `BEAM_TOPOLOGIES` (a rigid-beam type joins `AxleKinematics`'s coupled solve; a single-arm carrier joins `StationKinematics`'s revolute mode) |
 | A maneuver | `maneuvers.py` | Subclass `Maneuver`, use `simulate()`, return a `Result`; add to `STANDARD_SUITE` and `cli.TESTS` |
 | A driver behaviour | `driver.py` | Controllers are plain callables over `(state, dt)` |
 | A road surface | `solver.py` | `Road` takes `height_fn` and `friction_fn` |
@@ -202,12 +203,23 @@ roll-centre heights or anti-percentages anywhere in the code.
   not the shape you would want over a real network.
 - **No force feedback.** The wheel/gamepad input path is read-only; nothing
   is sent back to a wheel's motors.
-- **Beam axles are partly modelled.** Camber is coupled correctly through the
-  axle's roll, but the roll centre and the lateral location (Panhard rod, Watt's
-  link) are not solved — a proper axle-level kinematic solve is the fix.
-- **`suspension_couplings` (SVJ §23.5) are ignored.** Walking beams, equalizer
-  rockers, trunnion springs and shared air circuits are read but not simulated,
-  so multi-axle load sharing is wrong on vehicles that use them.
+- **Solid-axle/de-Dion beam axles (`solid_axle`, `de_dion`) are properly
+  solved**, as of `AxleKinematics` (`kinematics.py`): both sides' links and
+  the shared `axle_body` are solved as one rigid body (six freedoms, two
+  driven by each side's own commanded travel, the rest by whichever links
+  the file declares — trailing links, a Panhard rod, a Watt's link...), so
+  camber, toe/bump-steer and the roll centre all come from the real coupled
+  geometry instead of a per-side approximation. `torsion_beam`,
+  `parallelogram` and `pendulum_axle` are not covered by this yet — see
+  `BEAM_TOPOLOGIES` — nor is a *steered* beam axle (no bundled example
+  combines the two; it would need a genuinely 3D table indexed by jounce,
+  partner jounce and rack together).
+- **`suspension_couplings` (SVJ §23.5) are still ignored.** Walking beams,
+  equalizer rockers, trunnion springs and shared air/hydraulic circuits are
+  read but not simulated, so multi-axle load sharing is wrong on vehicles
+  that use them — a different problem from the axle kinematics above (this
+  one is mass/spring load-sharing *between* axles, via a rocker, beam or
+  fluid circuit, not the rigid-body kinematics *within* one axle).
 - **No compliance.** Tier 2 `compliance_summary` and Tier 3 bushings are parsed
   but not applied; all joints are rigid.
 - **No thermal models.** Tire, brake and engine thermal data is read but not
@@ -219,8 +231,11 @@ roll-centre heights or anti-percentages anywhere in the code.
 
 ## 5. Next, roughly in order
 
-1. **Axle-level kinematics** for beam axles and `suspension_couplings`, which
-   together make the truck and trailer examples trustworthy.
+1. **`suspension_couplings`** (walking beams, equalizer rockers, trunnion
+   springs, pneumatic/hydraulic circuits) — the other half of "trustworthy
+   truck and trailer examples" alongside the axle kinematics above; a
+   mass/spring load-sharing problem, not a kinematic one, so it wants its own
+   design rather than extending `AxleKinematics`.
 2. **Compliance**, at least Tier 2 — it changes limit balance noticeably.
 3. **Thermal models** for tires and brakes, so long runs and fade behave.
 4. **Force feedback** for a connected wheel, once there is a wheel worth

@@ -1,0 +1,2 @@
+# cmd.exe can misparse multi-line blocks in batch files with LF-only endings
+*.bat text eol=crlf
