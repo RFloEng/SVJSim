@@ -79,6 +79,15 @@ aside.right{border-right:none;border-left:1px solid var(--line)}
   background:rgba(15,17,22,.72);border:1px solid var(--line);border-radius:8px;
   padding:8px 11px}
 #viewControls label{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+#viewControls{max-width:330px}
+#meshRow{margin-top:9px;padding-top:8px;border-top:1px solid var(--line)}
+#meshRow .rowhead{font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px}
+#meshStatus{font-size:11px;line-height:1.4;margin-bottom:6px}
+#meshStatus .good{color:var(--good)} #meshStatus .bad{color:var(--bad)}
+#meshRow .meshbtns{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+#meshRow button,#meshRow select{font-size:11px;padding:3px 7px}
+#meshRow .opacity{margin-top:6px;gap:8px}
+#meshRow .opacity input{flex:1;min-width:80px}
 #playbar{position:absolute;left:12px;right:12px;bottom:12px;background:rgba(15,17,22,.9);
   border:1px solid var(--line);border-radius:9px;padding:9px 12px;display:none;
   align-items:center;gap:11px}
@@ -137,7 +146,7 @@ ul.msgs li{margin:4px 0;color:var(--muted);font-size:12px}
     <button id="openBtn">Open</button>
     <button id="fileBtn">Load file…</button>
     <button id="exportBtn" disabled title="Download the current setup as an SVJ override file">Export override</button>
-    <input type="file" id="fileInput" accept=".json" hidden>
+    <input type="file" id="fileInput" accept=".json,.glb,.gltf" multiple hidden>
   </header>
 
   <main>
@@ -151,6 +160,24 @@ ul.msgs li{margin:4px 0;color:var(--muted);font-size:12px}
       <div id="viewhud">—</div>
       <div id="viewControls">
         <label><input type="checkbox" id="showForces"> Forces, friction circles &amp; CG vectors</label>
+        <div id="meshRow" style="display:none">
+          <div class="rowhead">Vehicle mesh</div>
+          <div id="meshStatus"></div>
+          <div class="meshbtns">
+            <button id="meshPickBtn" title="Pick the .glb this vehicle's file refers to">Load .glb…</button>
+            <input type="file" id="meshInput" accept=".glb,.gltf" hidden>
+            <select id="meshAxes" title="How the mesh's own axes map onto the vehicle">
+              <option value="auto">Axes: auto</option>
+              <option value="sae">SAE J670</option>
+              <option value="yup_negz">Y-up, −Z forward</option>
+              <option value="yup_posz">Y-up, +Z forward</option>
+            </select>
+            <label title="Move the mesh onto the wheel box instead of trusting its own origin">
+              <input type="checkbox" id="meshFit"> Fit to wheels</label>
+          </div>
+          <label class="opacity">Opacity
+            <input type="range" id="meshOpacity" min="0.1" max="1" step="0.05" value="0.6"></label>
+        </div>
       </div>
       <div id="playbar">
         <button id="playBtn">▶</button>
@@ -250,6 +277,9 @@ const S = {
   frame: 0,
   lastTick: 0,
   showForces: false,
+  meshAxes: "auto",       // how to read a mesh's axes: auto | sae | yup_negz | yup_posz
+  meshFit: false,          // move a mesh onto the wheel box
+  meshOpacity: 0.6,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -593,6 +623,7 @@ const Viewer = (() => {
   let renderer, scene, camera, controls, root, stations = [], body, run = null, info = null;
   let chassisBox = null, chassisEdges = null, worldGroup = null, gridMesh = null, axisLines = null;
   let cgVelocityArrow = null, cgForceArrow = null;
+  let meshRoots = [], lastData = null;
   const COLOR = { link: 0x5aa9e6, wheel: 0x2b303a, rim: 0x8e99ad,
                   chassis: 0x59647a, cg: 0xe0b341, spoke: 0xff4d4d };
 
@@ -673,11 +704,13 @@ const Viewer = (() => {
     stations = [];
     chassisBox = null; chassisEdges = null;
     cgVelocityArrow = null; cgForceArrow = null;
+    meshRoots = [];
   }
 
-  function build(data) {
+  function build(data, options = {}) {
     if (!renderer) init();
     clear();
+    lastData = data;
     info = data.info;
     run = null; $("playbar").classList.remove("on");
 
@@ -727,14 +760,14 @@ const Viewer = (() => {
     body.add(cgForceArrow);
 
     data.geometry.forEach(g => stations.push(buildStation(g)));
-    fitCamera(length, width);
+    if (!options.keepCamera) fitCamera(length, width);
     updatePose();
     // Station visual meshes are only positioned by articulateStations() inside
     // updatePose(), which already ran synchronously above -- a freshly
     // attached mesh needs one more pose pass or it sits at its group's
     // identity transform until the next frame/drive update happens to fire.
     attachVisualMeshes(data)
-      .then(() => updatePose())
+      .then(() => updatePose(run ? S.frame : undefined))
       .catch(err => console.warn("SVJSim: visual mesh attachment failed", err));
   }
 
@@ -888,7 +921,7 @@ const Viewer = (() => {
   // convert an SVJ-frame rotation for direct use as a three.js object
   // transform (three.x=x, three.y=-z, three.z=y — the same axis change
   // toThree() performs on points). It shows up twice here: once folded into
-  // `assetAxisQuaternion` (converting a mesh's own authored coordinates into
+  // `FRAME_QUATS` (converting a mesh's own authored coordinates into
   // this frame) and once in `conjugateIntoThree` (converting the SAME
   // rodrigues() rotation `movePoint` already uses on raw SVJ vectors, but for
   // a case — a whole mesh — where the rotation has to be a THREE object's own
@@ -913,25 +946,30 @@ const Viewer = (() => {
     return M_QUAT.clone().multiply(qSvj).multiply(M_QUAT_INV);
   }
 
-  // The fixed rotation that converts a point already expressed in a glTF
-  // asset's own declared axis convention into the SAME three.js frame
-  // toThree() produces from raw SVJ coordinates — so a mesh authored under
-  // that convention lines up with the SVJ hardpoints it represents.
-  //
-  // Derived from the SAE J670 -> Blender axis table in SVJ_Spec.md §22.4
-  // (+X forward -> -Z, +Y right -> +X, +Z down -> -Y) composed with toThree()
-  // itself; verified against a synthetic test asset built the same way. Only
-  // that one declared convention (Blender's, "up: Y, forward: -Z" — the
-  // spec's own stated default) is handled precisely; anything else declared
-  // falls back to it with a console warning rather than silently guessing at
-  // a general per-axis solver for a case the spec does not fully worked-example.
-  function assetAxisQuaternion(coordinateSystem) {
-    if (!coordinateSystem || typeof coordinateSystem === "string") {
-      // "SAE_J670" (or absent): the asset's own vertices are authored
-      // directly in the physics frame, so the plain SVJ -> three conversion
-      // (M itself) applies, same as any hardpoint.
-      return M_QUAT;
-    }
+  // Rotations taking a point in a glTF asset's own axes to the three.js frame
+  // toThree() produces from raw SVJ coordinates, for the conventions meshes
+  // actually arrive in:
+  //   sae       the numbers ARE SVJ numbers (x forward, y right, z down)
+  //   yup_negz  Y up, -Z forward, +X right: Blender's default, and the one
+  //             SVJ 22.4 documents (+X fwd -> -Z, +Y right -> +X, +Z down -> -Y)
+  //   yup_posz  Y up, +Z forward, +X left: the glTF spec's own convention
+  const FRAME_QUATS = {
+    sae: M_QUAT,
+    yup_negz: matrixToQuaternion([[0, 0, -1], [0, 1, 0], [1, 0, 0]]),
+    yup_posz: matrixToQuaternion([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
+  };
+  const FRAME_LABELS = {
+    sae: "SAE J670 (x forward, z down)",
+    yup_negz: "glTF Y-up, -Z forward",
+    yup_posz: "glTF Y-up, +Z forward",
+    declared: "as declared in the file",
+  };
+
+  // The fixed rotation for a coordinate_system the file declared as an object
+  // (22.4). Only Blender's (up Y, forward -Z, the spec's own stated default)
+  // is handled precisely; anything else falls back to it with a console
+  // warning rather than silently guessing at a general per-axis solver.
+  function declaredAxisQuaternion(coordinateSystem) {
     const up = String(coordinateSystem.up || "Y").toUpperCase();
     const forward = String(coordinateSystem.forward || "-Z").toUpperCase();
     if (up !== "Y" || forward !== "-Z") {
@@ -939,8 +977,51 @@ const Viewer = (() => {
         'is not the Blender default ("Y", "-Z") this viewer maps precisely; using that ' +
         "mapping anyway, so this asset's placement should be checked by eye.");
     }
-    // Composed: three.x=-d.z, three.y=d.y, three.z=d.x.
-    return matrixToQuaternion([[0, 0, -1], [0, 1, 0], [1, 0, 0]]);
+    return FRAME_QUATS.yup_negz;
+  }
+
+  // Which axes a mesh uses. The user's explicit choice wins. Otherwise an
+  // object declared in the file is trusted. A bare "SAE_J670" says the numbers
+  // are SAE, but files in the wild write exactly that label over a Y-up
+  // glTF, whose car runs along Z rather than X. The longest axis tells the
+  // two apart, so that is what decides. Which END of Z is the front is then
+  // read from the part names (both -Z and +Z forward turn up under the same
+  // label); if the names don't settle
+  // it, the SVJ 22.4 default is used. Either way the guess is reported, never
+  // silent, and the Axes selector overrides it.
+  function pickMeshFrame(declared, scene) {
+    if (S.meshAxes && S.meshAxes !== "auto") return { key: S.meshAxes, guessed: false };
+    if (declared && typeof declared === "object") return { key: "declared", guessed: false };
+    scene.updateMatrixWorld(true);
+    const size = new THREE.Box3().setFromObject(scene).getSize(new THREE.Vector3());
+    if (size.z > size.x * 1.15 && size.z >= size.y) {
+      const named = frontFromNames(scene);
+      return { key: named || "yup_negz", guessed: true, how: named ? "from part names" : "default" };
+    }
+    return { key: "sae", guessed: false };
+  }
+
+  // Where the parts that say "front" sit along Z compared with the ones that
+  // say "rear". Whole words only ("bumper_f", "plate_b", "bonnet", never the
+  // "lf" in "caliper_lf"); the median keeps a stray unplaced part (a light-glow
+  // billboard left well off the car, say) from outvoting the rest.
+  // Returns "yup_posz", "yup_negz", or null when the names don't decide it.
+  function frontFromNames(scene) {
+    const FRONT = new Set(["f", "front", "bonnet", "hood", "nose"]);
+    const REAR = new Set(["r", "b", "rear", "back", "boot", "trunk", "exhaust", "tail"]);
+    const front = [], rear = [];
+    scene.traverse(o => {
+      if (!o.isMesh) return;
+      const words = String(o.name).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+      const z = new THREE.Box3().setFromObject(o).getCenter(new THREE.Vector3()).z;
+      if (words.some(w => FRONT.has(w))) front.push(z);
+      else if (words.some(w => REAR.has(w))) rear.push(z);
+    });
+    if (!front.length || !rear.length) return null;
+    const median = a => { const b = [...a].sort((x, y) => x - y); return b[Math.floor(b.length / 2)]; };
+    const gap = median(front) - median(rear);
+    if (Math.abs(gap) < 0.3) return null;
+    return gap > 0 ? "yup_posz" : "yup_negz";
   }
 
   // Fades a placeholder to a translucent wireframe once a real mesh is shown
@@ -975,33 +1056,76 @@ const Viewer = (() => {
     return gltfAssetCache.get(asset.url);
   }
 
-  // Wraps a cloned glTF node in a fixed-rotation group that lands it in the
-  // same "SVJ point, run through toThree()" space every other piece of
-  // geometry in this viewer already uses — so callers can then move/rotate
-  // that wrapper exactly like they would a procedural mesh's own
-  // position/quaternion (see attachVisualMeshes for the two ways that
-  // happens: fixed for the chassis, per-frame for a wheel station).
-  function wrapVisualNode(node, coordinateSystem) {
-    const axisGroup = new THREE.Group();
-    axisGroup.quaternion.copy(assetAxisQuaternion(coordinateSystem));
-    axisGroup.add(node);
-    return axisGroup;
+  // Meshes modelled around their own origin but never moved into place:
+  // some exports leave each tyre, disc and caliper at (0,0,0) for the
+  // simulator to instance at the hubs. Drawn where they sit they would pile
+  // up in the middle of the car, so they are left out of a whole-model view.
+  function unplacedParts(root) {
+    root.updateMatrixWorld(true);
+    const parts = [];
+    root.traverse(o => {
+      if (!o.isMesh) return;
+      const box = new THREE.Box3().setFromObject(o);
+      const size = box.getSize(new THREE.Vector3());
+      if (box.getCenter(new THREE.Vector3()).length() < 0.05 && Math.max(size.x, size.y, size.z) < 1.0) {
+        parts.push(o);
+      }
+    });
+    return parts;
+  }
+
+  // See-through, so the procedural geometry underneath stays visible: that
+  // overlap is the whole point of drawing both. Originals are remembered so
+  // the slider can be moved back and forth without compounding.
+  function applyMeshOpacity(root, opacity) {
+    root.traverse(o => {
+      if (!o.isMesh) return;
+      (Array.isArray(o.material) ? o.material : [o.material]).forEach(mat => {
+        if (!mat) return;
+        if (mat.__orig === undefined) {
+          mat.__orig = { transparent: mat.transparent, opacity: mat.opacity, depthWrite: mat.depthWrite };
+        }
+        mat.transparent = mat.__orig.transparent || opacity < 0.99;
+        mat.opacity = mat.__orig.opacity * opacity;
+        mat.depthWrite = opacity >= 0.99 ? mat.__orig.depthWrite : false;
+        mat.needsUpdate = true;
+      });
+    });
+  }
+
+  function setMeshStatus(lines) {
+    const el = $("meshStatus");
+    if (!el) return;
+    el.innerHTML = lines.map(l => `<div class="${l.bad ? "bad" : "good"}">${l.text}</div>`).join("");
+    const declared = S.data && (S.data.assets || []).length > 0;
+    $("meshRow").style.display = (lines.length || declared) ? "" : "none";
   }
 
   async function attachVisualMeshes(data) {
+    const assets = data.assets || [];
     const bindings = data.visual_bindings || [];
-    if (!bindings.length) return;
-    const assetsById = new Map((data.assets || []).map(a => [a.id, a]));
-    const unavailable = new Set();
+    const status = [];
+    const assetsById = new Map(assets.map(a => [a.id, a]));
+    meshRoots = [];
+
+    // Report every asset the file declares, whether or not anything binds to it.
+    assets.filter(a => !a.available).forEach(a =>
+      status.push({ bad: true, text: `${a.id}: not loaded - ${a.reason || "unavailable"}` }));
+
+    const placement = new Map();            // asset id -> { pick, offset } shared by all its nodes
+    const wholeModel = new Set();
+    const nodesBound = new Map();
 
     for (const binding of bindings) {
       const asset = assetsById.get(binding.mesh_ref);
-      if (!asset) continue;
-      if (!asset.available) { unavailable.add(asset.id); continue; }
+      if (!asset || !asset.available) continue;
 
       let scene;
       try { scene = await loadGltfAsset(asset); }
       catch (err) {
+        if (!status.some(l => l.text.startsWith(`${asset.id}: could not`))) {
+          status.push({ bad: true, text: `${asset.id}: could not be read as glTF - ${err.message || err}` });
+        }
         console.warn(`SVJSim: could not load visual asset "${asset.id}" (${asset.url})`, err);
         continue;
       }
@@ -1011,12 +1135,35 @@ const Viewer = (() => {
       // load unchanged -- look it up the same way GLTFLoader stored it.
       const sanitizedName = THREE.PropertyBinding.sanitizeNodeName(binding.node);
       const node = scene.getObjectByName(binding.node) || scene.getObjectByName(sanitizedName);
-      if (!node) {
-        console.warn(`SVJSim: node "${binding.node}" was not found in asset "${asset.id}"`);
+      let clone;
+      if (node) {
+        clone = node.clone(true);
+        nodesBound.set(asset.id, (nodesBound.get(asset.id) || 0) + 1);
+      } else if (binding.kind === "chassis" && !wholeModel.has(asset.id)) {
+        // The file asks for a named node the glTF doesn't contain (a file can
+        // bind SVJ::body::chassis over a glTF whose parts all have their own
+        // names). The vehicle's visual is then
+        // the whole model, which is what the binding is for.
+        clone = scene.clone(true);
+        unplacedParts(clone).forEach(o => { o.visible = false; });
+        wholeModel.add(asset.id);
+      } else {
         continue;
       }
-      const clone = node.clone(true);
-      const axisGroup = wrapVisualNode(clone, data.coordinate_system);
+
+      if (!placement.has(asset.id)) {
+        placement.set(asset.id, { pick: pickMeshFrame(data.coordinate_system, scene), offset: null });
+      }
+      const place = placement.get(asset.id);
+      const axisGroup = new THREE.Group();
+      axisGroup.quaternion.copy(place.pick.key === "declared"
+        ? declaredAxisQuaternion(data.coordinate_system) : FRAME_QUATS[place.pick.key]);
+      axisGroup.add(clone);
+
+      if (S.meshFit) {
+        if (!place.offset) place.offset = meshFitOffset(data, axisGroup);
+        axisGroup.position.copy(place.offset);
+      }
 
       if (binding.kind === "chassis") {
         body.add(axisGroup);
@@ -1030,19 +1177,50 @@ const Viewer = (() => {
         station.visualMesh = poseGroup;
         ghost(station.wheel); ghost(station.rim); ghost(station.hub);
       } else if (binding.kind === "mass_body" && binding.position) {
-        axisGroup.position.copy(toThree(binding.position));
+        axisGroup.position.add(toThree(binding.position));
         body.add(axisGroup);
+      } else {
+        continue;                          // kind "other": no pose to give it yet
       }
-      // `kind === "other"`: a real binding was found but SVJSim does not yet
-      // know what pose to give it (see find_visual_bindings in server.py) —
-      // left unrendered rather than guessed at.
+      meshRoots.push(axisGroup);
     }
 
-    if (unavailable.size) {
-      console.warn("SVJSim: visual mesh file(s) not reachable — " +
-        "open the vehicle via Open/the examples list rather than drag-and-drop " +
-        "so its folder is known:", [...unavailable].join(", "));
-    }
+    placement.forEach((place, id) => {
+      const how = wholeModel.has(id)
+        ? "whole model shown (the file has no SVJ:: nodes to pick parts from)"
+        : `${nodesBound.get(id) || 0} named part(s) placed`;
+      const frame = FRAME_LABELS[place.pick.key] +
+        (place.pick.guessed ? ` (guessed${place.pick.how ? " " + place.pick.how : ""})` : "");
+      status.push({ bad: false, text: `${id}: ${how}; axes ${frame}${S.meshFit ? "; fitted to wheels" : ""}` });
+    });
+    bindings.forEach(b => {
+      const a = assetsById.get(b.mesh_ref);
+      if (a && a.available && !placement.has(a.id) && !status.some(l => l.text.startsWith(`${a.id}:`))) {
+        status.push({ bad: true, text: `${a.id}: loaded, but its node "${b.node}" is not in the file` });
+      }
+    });
+    meshRoots.forEach(r => applyMeshOpacity(r, S.meshOpacity));
+    setMeshStatus(status);
+  }
+
+  // Where to move a mesh so its footprint sits on the vehicle: centred on the
+  // wheel-centre box in x and y, with its lowest point on the ground. Off by
+  // default and only on request: an origin that doesn't match is exactly the
+  // sort of discrepancy this overlay exists to show, so it is never quietly
+  // corrected; "Fit" is for when you want to look past it.
+  function meshFitOffset(data, axisGroup) {
+    axisGroup.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(axisGroup);
+    const centre = box.getCenter(new THREE.Vector3());
+    const geo = data.geometry || [];
+    if (!geo.length) return new THREE.Vector3();
+    const xs = geo.map(g => g.wheel_center0[0]);
+    const ys = geo.map(g => g.wheel_center0[1]);
+    const groundZ = geo.reduce((a, g) => a + g.wheel_center0[2] + g.wheel.radius, 0) / geo.length;
+    return new THREE.Vector3(
+      (Math.min(...xs) + Math.max(...xs)) / 2 - centre.x,
+      -groundZ - box.min.y,
+      ys.reduce((a, b) => a + b, 0) / ys.length - centre.z);
   }
 
   // Full SAE 3-2-1 (yaw, pitch, roll) body->inertial rotation, expressed as a
@@ -1146,8 +1324,18 @@ const Viewer = (() => {
       s.hub.position.copy(toThree(centre));
       s.wheel.position.copy(toThree(centre));
       // The wheel spins about the upright's Y axis; a cylinder's axis is +Y in
-      // three, so rotate that onto the transformed spin axis.
-      const axis = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
+      // three, so rotate that onto the transformed spin axis. The hardpoints
+      // only give the solved part of that axis; the physics adds the static
+      // alignment on top (Station.resolve: static + solved - reference), and
+      // builds the axis from the resulting camber and steer (solver.py,
+      // _wheel_forces). Doing the same here is what makes a camber or toe
+      // change visible instead of only reaching the tyre maths.
+      const solvedAxis = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
+      const camberTotal = Math.asin(Math.max(-1, Math.min(1, solvedAxis.z))) + (g.camber_offset || 0);
+      const steerTotal = Math.atan2(-solvedAxis.x, solvedAxis.y) + (g.toe_offset || 0);
+      const axis = new THREE.Vector3(-Math.sin(steerTotal) * Math.cos(camberTotal),
+                                     Math.cos(steerTotal) * Math.cos(camberTotal),
+                                     Math.sin(camberTotal));
       const axisThree = new THREE.Vector3(axis.x, -axis.z, axis.y).normalize();
       const align = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), axisThree);
       // `align` alone has no defined twist about that axis (setFromUnitVectors
@@ -1167,23 +1355,34 @@ const Viewer = (() => {
 
       if (s.visualMesh) {
         // A station's mesh node (unlike the procedural hub/wheel, which has
-        // no shape of its own) already sits at wherever its author placed it
-        // in the shared vehicle-frame asset -- often the whole car modeled
-        // together in one file, per real SVJ examples (chassis + all four
-        // uprights sharing corvette_c3.glb). Overwriting that with the
-        // theoretical wheel_center0 position would force every mesh to
-        // coincide with the procedural placeholder by construction, hiding
-        // exactly the kind of hardpoint authoring error this overlay exists
-        // to reveal. So only the INCREMENTAL motion since the design pose
-        // (jounce 0, rack centered) is applied -- the same jounce/steer
-        // delta the procedural geometry itself undergoes -- leaving whatever
-        // absolute offset the asset already has fully visible.
+        // no shape of its own) already sits where its author put it in the
+        // shared vehicle-frame asset: often the whole car modelled together
+        // in one file. Overwriting that with the theoretical wheel_center0
+        // would force every mesh onto the procedural placeholder by
+        // construction, hiding exactly the hardpoint authoring error this
+        // overlay exists to reveal. So only the CHANGE since the design pose
+        // is applied: the solved jounce/steer motion, plus any change the
+        // user has made to alignment since the file's own setup (the mesh
+        // already shows the file's own camber, so the file's value is zero
+        // here, not the absolute figure the procedural wheel above uses).
+        //
+        // That change is a rotation about the WHEEL CENTRE followed by the
+        // centre's own move, so for a mesh authored at absolute positions
+        // the transform is  position = centre_now - R * centre_design,
+        // rotation = R. (Using the centre's displacement alone, as this
+        // once did, quietly swings the mesh about the body origin instead,
+        // which is harmless for a millimetre of jounce and wrong for a
+        // visible camber change.)
         const design = poseAt(g, 0, 0);
         const designQuaternion = rodrigues(design.theta);
-        const deltaPosition = [p.d[0] - design.d[0], p.d[1] - design.d[1], p.d[2] - design.d[2]];
-        const deltaQuaternion = quaternion.clone().multiply(designQuaternion.clone().invert());
-        s.visualMesh.position.copy(toThree(deltaPosition));
-        s.visualMesh.quaternion.copy(conjugateIntoThree(deltaQuaternion));
+        const align = new THREE.Quaternion().multiplyQuaternions(
+          new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), g.mesh_toe_delta || 0),
+          new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), g.mesh_camber_delta || 0));
+        const total = align.multiply(quaternion.clone().multiply(designQuaternion.clone().invert()));
+        const total3 = conjugateIntoThree(total);
+        const designCentre = [origin[0] + design.d[0], origin[1] + design.d[1], origin[2] + design.d[2]];
+        s.visualMesh.quaternion.copy(total3);
+        s.visualMesh.position.copy(toThree(centre)).sub(toThree(designCentre).applyQuaternion(total3));
       }
 
       const forces = forcesOf ? forcesOf(g.name) : null;
@@ -1559,18 +1758,60 @@ const Viewer = (() => {
     renderer.render(scene, camera);
   }
 
-  return { build, attachRun, setFrame, updatePose, updateLive, enterDrive, exitDrive };
+  // Re-place the meshes (new axes, fit, or a freshly picked file) without
+  // losing the camera or a run that is being played back.
+  function refreshMeshes() {
+    if (!lastData) return;
+    const keep = run;
+    build(lastData, { keepCamera: true });
+    if (keep) {
+      run = keep;
+      $("playbar").classList.add("on");
+      setFrame(S.frame);
+    }
+  }
+
+  function setMeshOpacity(opacity) {
+    S.meshOpacity = opacity;
+    meshRoots.forEach(r => applyMeshOpacity(r, opacity));
+  }
+
+  return { build, attachRun, setFrame, updatePose, updateLive, enterDrive, exitDrive,
+           refreshMeshes, setMeshOpacity };
 })();
 
 // ── Wiring ───────────────────────────────────────────────────────────
 $("fileBtn").onclick = () => $("fileInput").click();
-$("fileInput").onchange = (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => loadDocument(reader.result, file.name);
-  reader.readAsText(file);
-};
+// A vehicle file and, optionally, the mesh it refers to, picked or dropped
+// together. The browser never reveals a file's path, so a mesh that can't be
+// found next to the JSON has to be handed over explicitly.
+async function loadFiles(fileList) {
+  const files = [...fileList];
+  const json = files.find(f => /\.json$/i.test(f.name));
+  const mesh = files.find(f => /\.(glb|gltf)$/i.test(f.name));
+  if (json) await loadDocument(await json.text(), json.name);
+  if (mesh) await attachMesh(mesh);
+}
+
+async function attachMesh(file) {
+  const assets = (S.data && S.data.assets) || [];
+  const target = assets.find(a => !a.available) || assets[0];
+  if (!target) { toast("Load a vehicle whose file declares a mesh first", true); return; }
+  try {
+    const data = await api(`/api/asset?id=${encodeURIComponent(target.id)}&name=${encodeURIComponent(file.name)}`,
+                           { method: "POST", body: file });
+    applyVehicle(data, false);
+    toast(`Using ${file.name} for ${target.id}`);
+  } catch (err) { toast(String(err.message || err), true); }
+}
+
+$("fileInput").onchange = (e) => { loadFiles(e.target.files); e.target.value = ""; };
+
+$("meshPickBtn").onclick = () => $("meshInput").click();
+$("meshInput").onchange = (e) => { if (e.target.files[0]) attachMesh(e.target.files[0]); e.target.value = ""; };
+$("meshAxes").onchange = () => { S.meshAxes = $("meshAxes").value; Viewer.refreshMeshes(); };
+$("meshFit").onchange = () => { S.meshFit = $("meshFit").checked; Viewer.refreshMeshes(); };
+$("meshOpacity").oninput = () => Viewer.setMeshOpacity(parseFloat($("meshOpacity").value));
 
 ["dragenter", "dragover"].forEach(type =>
   document.addEventListener(type, e => { e.preventDefault(); $("drop").classList.add("on"); }));
@@ -1580,13 +1821,7 @@ $("fileInput").onchange = (e) => {
     if (type === "dragleave" && e.relatedTarget) return;
     $("drop").classList.remove("on");
   }));
-document.addEventListener("drop", e => {
-  const file = e.dataTransfer.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => loadDocument(reader.result, file.name);
-  reader.readAsText(file);
-});
+document.addEventListener("drop", e => { if (e.dataTransfer.files.length) loadFiles(e.dataTransfer.files); });
 
 $("openBtn").onclick = async () => {
   const path = $("examples").value;

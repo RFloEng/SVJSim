@@ -1,5 +1,28 @@
 # SVJSim Changelog
 
+## Unreleased — Vehicle meshes that load, and alignment you can see
+
+- **Static camber and toe now show in the 3D view.** The server used to send
+  only the solved suspension motion, so a camber or toe change reached the tyre
+  maths but never the picture. The viewer now builds the wheel axis the way the
+  solver does (static alignment plus solved motion), and a mesh bound to a
+  station follows alignment changes made since the file's own setup.
+- **Mesh pose is a rotation about the wheel centre**, not about the body
+  origin. Harmless for a millimetre of jounce, wrong for a visible camber change.
+- **Loading the `.glb` that belongs to a `.svj.json`.** `../meshes/x.glb` style
+  URIs (meshes kept in a sibling folder) now resolve, served only for glTF/image
+  extensions; absolute paths, drive letters and URLs are still refused. Load
+  file and drag-and-drop locate the file's folder when it is unambiguous, a
+  *Load .glb…* button (or a `.glb` dropped with the JSON) supplies it when the
+  browser can't, and the viewport shows per-asset status with the reason when a
+  mesh doesn't load.
+- **Meshes that don't follow the SVJ naming.** When a file has no `SVJ::` nodes
+  the whole model is shown as the chassis visual (unplaced tyre/disc/caliper
+  parts left out). Y-up glTF written over a bare `SAE_J670` label is detected,
+  and which end is the front is read from part names (`bumper_f`, `bonnet`,
+  `plate_b`…), falling back to the SVJ §22.4 default. The guess is reported, and
+  an Axes selector, opacity slider and optional *Fit to wheels* override it.
+
 ## v0.5.0 — Axle-level kinematics for beam axles
 
 - **`solid_axle`/`de_dion` beam axles are now properly solved, not

@@ -13,16 +13,18 @@ scratch. So anything the GUI can do is reproducible from a file, exportable as a
 
 from __future__ import annotations
 
+import glob
 import json
 import mimetypes
 import re
 import threading
+import time
 import traceback
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -30,13 +32,14 @@ import numpy as np
 
 from . import maneuvers as mv
 from .kinematics import to_svj_camber, to_svj_toe
-from .model import SimVehicle, build_vehicle
+from .model import SimVehicle, build_vehicle, static_alignment
 from .realtime import RealtimeSession
 from .solver import Environment, Road, VehicleDynamics
 from .telemetry import Result
 from .util import dig, merge_patch, num, vec3
 
 APP_HTML = Path(__file__).with_name("webapp.html")
+MAX_ASSET_BYTES = 400 * 2**20          # the biggest hand-picked mesh accepted
 
 TESTS = {
     "acceleration": ("Acceleration", mv.Acceleration),
@@ -309,47 +312,86 @@ def find_visual_bindings(doc: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
-def resolve_assets(doc: dict[str, Any], source_dir: Path | None) -> list[dict[str, Any]]:
+def resolve_assets(doc: dict[str, Any], source_dir: Path | None,
+                   uploaded: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """The `assets.meshes` manifest, each entry resolved to a fetchable URL.
 
-    `uri` is relative to the SVJ file itself (§22.2); resolving it needs to
-    know where that file lives on disk, which only a file opened via `/api/open`
-    (the picker or the examples list) provides. A vehicle loaded by dragging
-    JSON text into the browser carries no such path, so its meshes are listed
-    but marked unavailable rather than silently dropped — the file still
-    reports what it *wants* to show.
+    `uri` is relative to the SVJ file itself (§22.2), so resolving it needs to
+    know where that file lives on disk. That is known for a file opened from
+    the picker or the command line, and found for a "Load file…" / drag-and-drop
+    one when an identical file turns up under the search roots (see
+    `Handler._locate_source`). When it is still unknown, a mesh the user
+    picked by hand (`uploaded`, keyed by asset id) stands in for it.
+
+    An entry that cannot be served says why in `reason`, rather than just
+    being absent: the file still reports what it *wants* to show, and the
+    viewer can tell the user what to do about it.
     """
+    uploaded = uploaded or {}
     entries = []
     for mesh in (dig(doc, "assets", "meshes", default=[]) or []):
         if not isinstance(mesh, dict) or not isinstance(mesh.get("id"), str):
             continue
         uri = str(mesh.get("uri", ""))
         entry = {"id": mesh["id"], "uri": uri, "description": mesh.get("description"),
-                 "url": None, "available": False}
-        if source_dir is not None and uri:
+                 "url": None, "available": False, "reason": None, "source": None}
+        upload = uploaded.get(mesh["id"])
+        if upload is not None:
+            entry.update(url=f"/api/asset?id={quote(mesh['id'], safe='')}&v={upload['version']}",
+                         available=True, source=f"picked file {upload['name']}")
+        elif source_dir is None:
+            entry["reason"] = ("the folder this vehicle came from is unknown, so the mesh "
+                               "path can't be resolved")
+        elif not uri:
+            entry["reason"] = "the asset has no uri"
+        else:
             resolved = _safe_resolve(source_dir, uri)
-            if resolved is not None and resolved.is_file():
-                entry["url"] = f"/api/asset?uri={quote(uri, safe='')}"
-                entry["available"] = True
+            if resolved is None:
+                entry["reason"] = (f"'{uri}' is not a usable mesh path (it must be relative "
+                                   f"and end in .glb or .gltf)")
+            elif not resolved.is_file():
+                entry["reason"] = f"no file at {resolved}"
+            else:
+                entry.update(url=f"/api/asset?uri={quote(uri, safe='')}", available=True,
+                             source=str(resolved))
         entries.append(entry)
     return entries
 
 
+# Model and texture files are the only thing /api/asset will ever serve.
+_ASSET_EXTENSIONS = frozenset({".glb", ".gltf", ".bin", ".png", ".jpg", ".jpeg",
+                               ".webp", ".ktx2"})
+
+
 def _safe_resolve(root: Path, relative: str) -> Path | None:
-    """`root / relative`, refusing anything that escapes `root` (§22.2: the
-    spec already requires `uri` to be relative; this enforces it against a
-    file that tries `../../..` anyway)."""
+    """`root / relative` for a mesh `uri` (§22.2), or None if it isn't servable.
+
+    The spec requires `uri` to be relative, so absolute paths, drive letters
+    and URLs are refused. Climbing out of `root` with `..` is deliberately
+    *allowed*: real files do exactly that (`../meshes/car.glb`, the meshes
+    sitting in a sibling folder), and refusing it made those meshes
+    unloadable. What keeps that from becoming a
+    way to read arbitrary files is the extension allow-list — only model and
+    texture files are ever served, wherever they sit.
+    """
+    if not relative or "://" in relative:
+        return None
+    windows = PureWindowsPath(relative)
+    if windows.is_absolute() or windows.drive or relative.startswith(("/", "\\")):
+        return None
     try:
         candidate = (root / relative).resolve()
-        candidate.relative_to(root.resolve())
-    except (ValueError, OSError):
+    except (OSError, ValueError):
+        return None
+    if candidate.suffix.lower() not in _ASSET_EXTENSIONS:
         return None
     return candidate
 
 
 # ── Describing a built vehicle to the front end ───────────────────────
 
-def _station_geometry(vehicle: SimVehicle, station: Any) -> dict[str, Any]:
+def _station_geometry(vehicle: SimVehicle, station: Any,
+                      base_document: dict[str, Any] | None = None) -> dict[str, Any]:
     corner = dig(vehicle.source, "suspension", station.name, default={}) or {}
     topology = dig(corner, "topology", default={}) or {}
     hardpoints = {k: list(map(float, v)) for k, v in
@@ -367,6 +409,9 @@ def _station_geometry(vehicle: SimVehicle, station: Any) -> dict[str, Any]:
 
     kc = station.kc
     tire = station.tire
+    base_camber, base_toe = (static_alignment(base_document, station.name,
+                                              float(station.position0[1]))
+                             if base_document else (station.static_camber, station.static_toe))
     return {
         "name": station.name, "axle": station.axle, "side": station.side,
         "steered": bool(station.steered), "driven": bool(station.driven),
@@ -380,12 +425,26 @@ def _station_geometry(vehicle: SimVehicle, station: Any) -> dict[str, Any]:
         "rack": [float(v) for v in kc.rack],
         "pose_d": kc.pose_d.round(6).tolist(),
         "pose_theta": kc.pose_theta.round(6).tolist(),
+        # The wheel the physics actually runs has the static alignment added
+        # on top of what the hardpoints solve to (`Station.resolve`:
+        # static + solved - reference). `pose_theta` alone is just the solved
+        # part, so a viewer drawing only that never shows a camber or toe
+        # change — the sliders moved the tyre maths and nothing on screen.
+        "camber_offset": float(station.static_camber - station.camber_ref),
+        "toe_offset": float(station.static_toe - station.toe_ref),
+        # A mesh already shows the file's own alignment, so what it needs is
+        # only how far the setup has moved from that, not the absolute figure
+        # the procedural wheel (which *is* the model) uses.
+        "mesh_camber_delta": float(station.static_camber - base_camber),
+        "mesh_toe_delta": float(station.static_toe - base_toe),
         "static_load": float(station.static_load),
     }
 
 
 def describe(vehicle: SimVehicle, patch: dict[str, Any],
-             document: dict[str, Any], source_dir: Path | None = None) -> dict[str, Any]:
+             document: dict[str, Any], source_dir: Path | None = None,
+             uploaded_assets: dict[str, dict[str, Any]] | None = None,
+             base_document: dict[str, Any] | None = None) -> dict[str, Any]:
     stations = []
     for s in vehicle.stations:
         rc = s.roll_centre_height()
@@ -432,7 +491,7 @@ def describe(vehicle: SimVehicle, patch: dict[str, Any],
             "max_rack": round(float(vehicle.steering.max_rack), 6),
         },
         "stations": stations,
-        "geometry": [_station_geometry(vehicle, s) for s in vehicle.stations],
+        "geometry": [_station_geometry(vehicle, s, base_document) for s in vehicle.stations],
         "report": {"confidence": vehicle.report.confidence,
                    "warnings": vehicle.report.warnings,
                    "estimates": vehicle.report.estimates,
@@ -445,7 +504,7 @@ def describe(vehicle: SimVehicle, patch: dict[str, Any],
                   for k, v in TESTS.items()],
         # glTF visual binding layer (SVJ §22) — see find_visual_bindings/
         # resolve_assets for what these actually mean.
-        "assets": resolve_assets(document, source_dir),
+        "assets": resolve_assets(document, source_dir, uploaded_assets),
         "visual_bindings": find_visual_bindings(document),
         "coordinate_system": dig(document, "_metadata", "coordinate_system", default=None),
     }
@@ -479,7 +538,9 @@ class RunRecord:
 class Session:
     base_document: dict[str, Any] | None = None
     source_name: str = ""
-    source_dir: Path | None = None    # None for a drag-and-dropped file: no known folder
+    source_dir: Path | None = None    # None when the file's folder could not be found
+    # Meshes the user picked by hand, keyed by asset id: {name, data, version}.
+    uploaded_assets: dict[str, dict[str, Any]] = field(default_factory=dict)
     patch: dict[str, Any] = field(default_factory=dict)
     vehicle: SimVehicle | None = None
     friction: float = 1.0
@@ -493,6 +554,7 @@ class Session:
         self.base_document = document
         self.source_name = name
         self.source_dir = source_dir
+        self.uploaded_assets = {}        # a picked mesh belongs to one vehicle
         self.patch = {}
         return self.rebuild()
 
@@ -505,7 +567,29 @@ class Session:
         self.stop_drive()
         merged = merge_patch(self.base_document, self.patch)
         self.vehicle = build_vehicle(merged)
-        return describe(self.vehicle, self.patch, merged, self.source_dir)
+        return describe(self.vehicle, self.patch, merged, self.source_dir,
+                        self.uploaded_assets, self.base_document)
+
+    def attach_asset(self, asset_id: str, name: str, data: bytes) -> dict[str, Any]:
+        """Use `data` as the mesh for `asset_id`, in place of whatever file the
+        vehicle's own `uri` points to. A rebuild (setup edits) keeps it."""
+        if self.base_document is None:
+            raise ValueError("no vehicle has been loaded yet")
+        known = {m.get("id") for m in (dig(self.base_document, "assets", "meshes",
+                                           default=[]) or []) if isinstance(m, dict)}
+        if asset_id not in known:
+            raise ValueError(f"this vehicle has no mesh asset '{asset_id}'")
+        # A file that lists the same mesh under two ids (a chassis and a wheel
+        # set that are one .glb) means one picked file, not two.
+        meshes = [m for m in (dig(self.base_document, "assets", "meshes", default=[]) or [])
+                  if isinstance(m, dict)]
+        uri = next((m.get("uri") for m in meshes if m.get("id") == asset_id), None)
+        for mesh in meshes:
+            if mesh.get("id") == asset_id or (uri and mesh.get("uri") == uri):
+                version = self.uploaded_assets.get(mesh["id"], {}).get("version", 0) + 1
+                self.uploaded_assets[mesh["id"]] = {"name": name, "data": data,
+                                                    "version": version}
+        return self.rebuild()
 
     def apply_setup(self, values: dict[str, float]) -> dict[str, Any]:
         if self.base_document is None:
@@ -624,9 +708,20 @@ class Handler(BaseHTTPRequestHandler):
 
     _ASSET_CONTENT_TYPES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json"}
 
-    def _serve_asset(self, uri: str) -> None:
-        # Drag-and-dropped vehicles have no known folder to resolve a mesh
-        # uri against; only a vehicle opened via /api/open carries one.
+    def _content_type(self, filename: str) -> str:
+        suffix = Path(filename).suffix.lower()
+        return (self._ASSET_CONTENT_TYPES.get(suffix)
+                or mimetypes.guess_type(filename)[0] or "application/octet-stream")
+
+    def _serve_asset(self, uri: str, asset_id: str = "") -> None:
+        if asset_id:                              # a mesh the user picked by hand
+            upload = self.session.uploaded_assets.get(asset_id)
+            if upload is None:
+                self._send({"error": "no mesh was picked for that asset"}, 404)
+            else:
+                self._send(upload["data"], content_type=self._content_type(upload["name"]))
+            return
+        # A file whose folder is unknown has nothing to resolve a uri against.
         if not uri or self.session.source_dir is None:
             self._send({"error": "no asset folder for this session"}, 404)
             return
@@ -634,10 +729,35 @@ class Handler(BaseHTTPRequestHandler):
         if resolved is None or not resolved.is_file():
             self._send({"error": "asset not found"}, 404)
             return
-        content_type = (self._ASSET_CONTENT_TYPES.get(resolved.suffix.lower())
-                         or mimetypes.guess_type(resolved.name)[0]
-                         or "application/octet-stream")
-        self._send(resolved.read_bytes(), content_type=content_type)
+        self._send(resolved.read_bytes(), content_type=self._content_type(resolved.name))
+
+    def _locate_source(self, name: str, document: dict[str, Any]) -> Path | None:
+        """Folder of the file `document` was read from, if it can be found.
+
+        Only an exact match counts: a file of that name under the search roots
+        that parses to *this very document*. A same-named but different file
+        (an edited copy, another car's `vehicle.svj.json`) is not the same
+        file, and borrowing its folder could load the wrong car's mesh.
+        """
+        if not name:
+            return None
+        deadline = time.monotonic() + 6.0         # the roots can be large trees
+        inspected = 0
+        for root in self.search_roots:
+            if not root.exists():
+                continue
+            for path in root.rglob(glob.escape(name)):
+                if time.monotonic() > deadline or inspected >= 200:
+                    return None
+                if not path.is_file():
+                    continue
+                inspected += 1
+                try:
+                    if json.loads(path.read_text(encoding="utf-8")) == document:
+                        return path.parent
+                except (OSError, ValueError):
+                    continue
+        return None
 
     # -- routes --------------------------------------------------------
 
@@ -656,7 +776,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     merged = merge_patch(self.session.base_document, self.session.patch)
                     self._send(describe(self.session.vehicle, self.session.patch, merged,
-                                        self.session.source_dir))
+                                        self.session.source_dir, self.session.uploaded_assets,
+                                        self.session.base_document))
             elif route.path == "/api/run":
                 run_id = (query.get("id") or [""])[0]
                 record = self.session.runs.get(run_id)
@@ -670,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
             elif route.path == "/api/dil/state":
                 self._send(self.session.require_drive().snapshot())
             elif route.path == "/api/asset":
-                self._serve_asset((query.get("uri") or [""])[0])
+                self._serve_asset((query.get("uri") or [""])[0], (query.get("id") or [""])[0])
             else:
                 self._send({"error": "not found"}, 404)
         except ValueError as exc:
@@ -681,15 +802,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:                 # noqa: N802
         route = urlparse(self.path)
         try:
+            if route.path == "/api/asset":
+                # A mesh file picked by hand: the body is the raw bytes, not JSON.
+                query = parse_qs(route.query)
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > MAX_ASSET_BYTES:
+                    raise ValueError(f"a mesh must be between 1 byte and "
+                                     f"{MAX_ASSET_BYTES // 2**20} MB")
+                self._send(self.session.attach_asset(
+                    (query.get("id") or [""])[0], (query.get("name") or ["mesh.glb"])[0],
+                    self.rfile.read(length)))
+                return
             body = self._body()
             if route.path == "/api/load":
                 document = body.get("document")
                 if isinstance(document, str):
                     document = json.loads(document)
-                # No source_dir: a drag-and-dropped file's folder is unknown,
-                # so any visual meshes it references are listed but not
-                # fetchable (see resolve_assets).
-                self._send(self.session.load(document, body.get("name", "vehicle.svj.json")))
+                name = body.get("name", "vehicle.svj.json")
+                # The browser gives us the text and name of a picked or dropped
+                # file but never its path; find the real file so its meshes
+                # (relative to it) can still be resolved.
+                self._send(self.session.load(document, name,
+                                             source_dir=self._locate_source(name, document)))
             elif route.path == "/api/open":
                 path = Path(body.get("path", ""))
                 document = json.loads(path.read_text(encoding="utf-8"))

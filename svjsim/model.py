@@ -753,6 +753,25 @@ def _build_steering(doc: dict[str, Any], stations: Sequence[Station],
                     lock_to_lock=num(spec, "lock_to_lock", default=2 * np.pi) or 2 * np.pi)
 
 
+def static_alignment(doc: dict[str, Any], station: str, y: float) -> tuple[float, float]:
+    """A station's static camber and toe, as absolute SAE rotations in radians.
+
+    Read straight from the document's `alignment` block, in whichever sign
+    convention the file declares (§9.6). A function of its own so the viewer
+    can ask what a *different* document says — the file as loaded, against the
+    version with the user's setup edits applied — without building a vehicle.
+    """
+    corner = clean((doc.get("suspension") or {}).get(station) or {})
+    alignment = clean(corner.get("alignment") or {})
+    convention = str(dig(doc, "_metadata", "alignment_convention",
+                         default="relative_to_centerline"))
+    camber_raw = num(alignment, "camber", default=0.0) or 0.0
+    toe_raw = num(alignment, "toe", default=0.0) or 0.0
+    if convention == "absolute":
+        return camber_raw, toe_raw
+    return from_svj_camber(camber_raw, y), from_svj_toe(toe_raw, y)
+
+
 def build_vehicle(source: Any, *, prefer_tire: str | None = None,
                   kc_samples: int = 21) -> SimVehicle:
     """Assemble a `SimVehicle` from an `svj.Vehicle` or a raw SVJ dictionary."""
@@ -867,17 +886,8 @@ def build_vehicle(source: Any, *, prefer_tire: str | None = None,
             report.estimate(f"{name}: no wheel spin inertia — estimated {spin:.2f} kg·m²")
         brake_disc_inertia = num(corner, "brake", "disc", "rotational_inertia", default=0.0) or 0.0
 
-        alignment = clean(corner.get("alignment") or {})
-        convention = str(dig(doc, "_metadata", "alignment_convention",
-                             default="relative_to_centerline"))
-        camber_raw = num(alignment, "camber", default=0.0) or 0.0
-        toe_raw = num(alignment, "toe", default=0.0) or 0.0
         y = float(table.wheel_center0[1])
-        if convention == "absolute":
-            static_camber, static_toe = camber_raw, toe_raw
-        else:
-            static_camber = from_svj_camber(camber_raw, y)
-            static_toe = from_svj_toe(toe_raw, y)
+        static_camber, static_toe = static_alignment(doc, name, y)
 
         axle_id = f"A{_station_axle(name)}"
         driven = bool(axles.get(axle_id, {}).get("driven")) or \
