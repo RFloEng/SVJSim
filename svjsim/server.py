@@ -255,52 +255,176 @@ def build_patch(document: dict[str, Any], values: dict[str, float]) -> dict[str,
 
 # ── glTF visual binding layer (SVJ §22) ────────────────────────────────
 #
-# A `visual` block ({mesh_ref, node}) may sit on *any* body object in the
-# file — the spec's own examples put it on `chassis` and directly on each
-# `suspension.<corner>` entry (not nested under `.wheel` or
-# `.topology.upright`, which the naming-convention table might suggest).
-# Every bundled SVJ example that uses this layer follows that same
-# `chassis` / `suspension.<corner>` placement, so rather than hardcode a
-# handful of expected paths, `find_visual_bindings` walks the whole document
-# and classifies whatever it finds by where it actually sits.
+# A `visual` block may sit on any part of the file (v0.99.2, §22.3): the
+# chassis and mass bodies, every piece of a suspension corner, steering,
+# powertrain and aero. Rather than hardcode the table, `find_visual_bindings`
+# walks the whole document and classifies each binding by where it sits,
+# because that decides how the part moves:
+#
+#   body      fixed to the sprung body, authored in the vehicle frame
+#             (chassis, mass bodies, steering, powertrain, aero, and the
+#             parts §22.6 gives no way to articulate: springs, dampers, ARBs,
+#             and links left at `rigid`)
+#   station   follows one station's solved upright pose (upright, axle body,
+#             caliper), with `spin` for the parts that also turn with the
+#             wheel (wheel, dual wheels, disc)
+#   link      `link_between_points` on a suspension link: inboard end fixed
+#             to the body, outboard end on an upright hardpoint, live
+#   segment   `link_between_points` on a driveshaft: joint to joint, static
+#   other     found, but there is no defined way to place it; reported
+#
+# Anything the spec calls an error (a placement on a carrier that can't take
+# it, a missing `mesh_ref` with several meshes declared, a node bound twice)
+# is carried as an `issue` on the binding so the viewer can show it, instead
+# of being silently dropped.
 
-_STATION_BINDING = re.compile(r"^\.suspension\.(\w+)(?:\..*)?$")
-_MASS_BODY_BINDING = re.compile(r"^\.chassis\.mass_bodies\[(\d+)\]$")
+_PLACEMENTS = ("rigid", "link_between_points")
+_MESH_AXES = ("+x", "-x", "+y", "-y", "+z", "-z")
+_CORNER_PART = {
+    "": "upright",                         # v0.97 corner-level binding
+    ".topology.upright": "upright",
+    ".topology.axle_body": "axle_body",
+    ".wheel": "wheel",
+    ".brake.disc": "disc",
+    ".brake.caliper": "caliper",
+    ".spring": "spring",
+    ".damper": "damper",
+    ".arb": "arb",
+}
+_SPINNING = {"wheel", "disc"}
+_BODY_FIXED_CORNER_PARTS = {"spring", "damper", "arb"}
 
 
 def find_visual_bindings(doc: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every `{mesh_ref, node}` binding in the document, with where it attaches.
+    """Every `visual` binding in the document, with how it attaches.
 
-    Returns one entry per binding: `{mesh_ref, node, path, kind, ...}` where
-    `kind` is `"chassis"` (follows the sprung body pose), `"station"` (follows
-    one wheel station's live K&C pose — carries a `station` key), `"mass_body"`
-    (a fixed offset in the body frame — carries `position`), or `"other"` (found
-    but not yet wired to a pose; SVJSim reports it rather than guessing).
+    One entry per binding: `{mesh_ref, node, path, kind, part, placement, ...}`
+    (kinds as described above). `station` names the station for corner parts;
+    `link` bindings carry `inboard` (the inboard end, already reduced per
+    `from_point`), `outboard` (the upright hardpoint's key) and `mesh_axis` /
+    `scale_to_length`; `segment` bindings carry `from`/`to`. A binding the file
+    gets wrong carries an `issue` string.
     """
+    meshes = [m.get("id") for m in (dig(doc, "assets", "meshes", default=[]) or [])
+              if isinstance(m, dict) and isinstance(m.get("id"), str)]
     found: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def classify(path: str) -> dict[str, Any]:
+    def link_ends(carrier: dict[str, Any], visual: dict[str, Any],
+                  entry: dict[str, Any]) -> bool:
+        """Fill in a link binding's two ends; False if the link doesn't have them."""
+        points = [list(map(float, p)) for p in (carrier.get("inboard_points") or [])
+                  if isinstance(p, (list, tuple)) and len(p) == 3]
+        outboard = str(carrier.get("outboard_ref", "")).split(".")[-1]
+        if not points or not outboard:
+            entry["issue"] = "link_between_points needs inboard_points and an outboard_ref"
+            return False
+        index = visual.get("from_point")
+        if isinstance(index, int) and not isinstance(index, bool):
+            if 0 <= index < len(points):
+                inboard = points[index]
+            else:
+                entry["issue"] = (f"from_point {index} is out of range for "
+                                  f"{len(points)} inboard point(s); using their centroid")
+                inboard = np.mean(points, axis=0).tolist()
+        else:
+            inboard = np.mean(points, axis=0).tolist()
+        entry.update(inboard=inboard, outboard=outboard, name=carrier.get("name"))
+        return True
+
+    def classify(path: str, carrier: dict[str, Any], visual: dict[str, Any],
+                 entry: dict[str, Any]) -> None:
+        placement = entry["placement"]
+        between = placement == "link_between_points"
+
         if path == ".chassis":
-            return {"kind": "chassis"}
-        station_match = _STATION_BINDING.match(path)
-        if station_match:
-            return {"kind": "station", "station": station_match.group(1)}
-        mass_match = _MASS_BODY_BINDING.match(path)
-        if mass_match:
-            body = dig(doc, "chassis", "mass_bodies", int(mass_match.group(1)), default={}) or {}
-            position = vec3(body, "position")
-            return {"kind": "mass_body",
-                    "position": position.tolist() if position is not None else None,
-                    "body_id": body.get("id")}
-        return {"kind": "other"}
+            entry.update(kind="body", part="chassis")
+        elif re.match(r"^\.chassis\.mass_bodies\[\d+\]$", path):
+            entry.update(kind="body", part="mass_body", body_id=carrier.get("id"))
+        elif match := re.match(r"^\.suspension\.([^.\[]+)(.*)$", path):
+            station, rest = match.group(1), match.group(2)
+            entry["station"] = station
+            if re.match(r"^\.topology\.links\[\d+\]$", rest):
+                entry["part"] = "link"
+                if between and link_ends(carrier, visual, entry):
+                    entry["kind"] = "link"
+                else:
+                    # §22.6: a rigid link is authored in the vehicle frame and
+                    # not moved, so it stays where the design pose put it.
+                    entry["kind"] = "body"
+                    between = False
+            elif re.match(r"^\.wheel\.positions\[\d+\]$", rest):
+                entry.update(kind="station", part="wheel", spin=True,
+                             label=carrier.get("label"))
+            elif rest in _CORNER_PART:
+                part = _CORNER_PART[rest]
+                entry["part"] = part
+                entry["legacy_corner"] = rest == ""
+                if part in _BODY_FIXED_CORNER_PARTS:
+                    entry["kind"] = "body"
+                else:
+                    entry.update(kind="station", spin=part in _SPINNING)
+            else:
+                entry.update(kind="other", part="unknown")
+        elif path == ".steering" or path.startswith(".steering."):
+            entry.update(kind="body", part="steering")
+        elif re.match(r"^\.powertrain\.driveshafts\[\d+\]$", path):
+            entry["part"] = "driveshaft"
+            ends = [vec3(carrier.get(key) or {}, "position") for key in ("joint_front", "joint_rear")]
+            if between and all(end is not None for end in ends):
+                entry.update(kind="segment", **{"from": ends[0].tolist(), "to": ends[1].tolist()})
+            else:
+                if between:
+                    entry["issue"] = "link_between_points needs joint_front/joint_rear positions"
+                entry["kind"] = "body"
+                between = False
+        elif path.startswith(".powertrain."):
+            entry.update(kind="body", part="powertrain")
+        elif re.match(r"^\.aerodynamics\.components\[\d+\]$", path):
+            entry.update(kind="body", part="aero")
+        else:
+            entry.update(kind="other", part="unknown")
+
+        if between and entry["kind"] not in ("link", "segment") and "issue" not in entry:
+            # §22.7 rule 5. Shown as rigid, which is what a parser that doesn't
+            # know `placement` would do anyway (§22.8).
+            entry["issue"] = "link_between_points is only valid on a link or a driveshaft; shown as rigid"
+        if entry["kind"] in ("link", "segment"):
+            axis = visual.get("mesh_axis", "+x")
+            entry["mesh_axis"] = axis if axis in _MESH_AXES else "+x"
+            entry["scale_to_length"] = bool(visual.get("scale_to_length", False))
 
     def walk(obj: Any, path: str) -> None:
         if isinstance(obj, dict):
             visual = obj.get("visual")
-            if (isinstance(visual, dict) and isinstance(visual.get("mesh_ref"), str)
-                    and isinstance(visual.get("node"), str)):
-                found.append({"mesh_ref": visual["mesh_ref"], "node": visual["node"],
-                             "path": path, **classify(path)})
+            if isinstance(visual, dict) and isinstance(visual.get("node"), str):
+                mesh_ref = visual.get("mesh_ref")
+                placement = visual.get("placement", "rigid")
+                entry: dict[str, Any] = {
+                    "mesh_ref": mesh_ref, "node": visual["node"], "path": path,
+                    "placement": placement if placement in _PLACEMENTS else "rigid",
+                }
+                if not isinstance(mesh_ref, str):
+                    # §22.3: may be omitted when exactly one mesh is declared.
+                    if len(meshes) == 1:
+                        entry["mesh_ref"] = meshes[0]
+                    else:
+                        entry["issue"] = (f"no mesh_ref, and {len(meshes)} meshes are declared "
+                                          "so it can't be inferred")
+                classify(path, obj, visual, entry)
+                key = (str(entry["mesh_ref"]), entry["node"])
+                if key in seen:
+                    first = seen[key]
+                    # §22.7 rule 4: one axle part bound from both of its stations
+                    # is correct; anything else bound twice is not. Drawn once.
+                    entry["duplicate_of"] = first["path"]
+                    if not (entry.get("station") and first.get("station")
+                            and entry.get("part") == first.get("part")
+                            and entry.get("part") == "axle_body"):
+                        entry.setdefault("issue", f"node already bound at {first['path']}")
+                else:
+                    seen[key] = entry
+                found.append(entry)
             for key, value in obj.items():
                 if key != "visual":
                     walk(value, f"{path}.{key}")

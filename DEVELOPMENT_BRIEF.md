@@ -113,8 +113,22 @@ visible rather than papered over. A station's mesh is moved only by the
 theoretical wheel centre, so a wrongly-placed hardpoint in the asset actually
 shows up instead of being silently corrected. `server.py` resolves
 `assets.meshes[].uri` against the SVJ file's own folder (`GET /api/asset`);
-a vehicle loaded via drag-and-drop has no such folder, so its meshes are
-reported unavailable rather than failing the whole load.
+for a vehicle loaded via drag-and-drop it looks for that folder under the
+search roots (exact JSON match only), and otherwise the user hands the mesh
+over with *Load .glb…*.
+
+Since SVJ v0.99.2 a binding can sit on any part, and *where* it sits decides
+how the part moves. `find_visual_bindings` classifies each one by path into
+`body` (fixed to the sprung body: chassis, mass bodies, steering, powertrain,
+aero, and springs/dampers/ARBs, which §22.6 gives no way to articulate),
+`station` (the upright's pose; wheels and discs also spin about the design
+axis), `link` (`link_between_points`: node origin on the inboard end,
+`mesh_axis` onto the live outboard hardpoint) and `segment` (a driveshaft,
+joint to joint). The spec leaves a link's roll about its own axis open; SVJSim
+keeps the asset's up as close to the vehicle's up as the link allows, chosen
+once at the design pose so a part never flips mid-travel. All assets of one
+file share one set of axes (§22.4 is per file), decided from the chassis's
+asset, because a small asset can't be read from its shape.
 
 ### The equations of motion
 

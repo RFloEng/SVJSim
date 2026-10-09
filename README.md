@@ -66,7 +66,13 @@ load it.
 the SVJ file has a `visual` binding to a glTF asset (SVJ §22), the 3D view loads
 and draws it alongside the procedural placeholder — the placeholder ghosts to a
 dim wireframe rather than disappearing, so you can see exactly where a real
-mesh and the physics model's own hardpoints agree or don't.
+mesh and the physics model's own hardpoints agree or don't. Every part SVJ
+v0.99.2 can bind is placed by what it is: uprights and calipers follow the
+solved suspension, wheels and discs also spin, links bound with
+`link_between_points` stretch between their live hardpoints, and the body,
+steering, powertrain and aero parts ride on the chassis. If the mesh file sits
+somewhere the app can't find, *Load .glb…* (or dropping it with the JSON)
+supplies it.
 
 **Tire forces and friction circles, live.** A checkbox over the 3D view draws,
 at each wheel's contact patch, a ring sized to the tire's currently available

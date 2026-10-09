@@ -1,6 +1,6 @@
 # SVJSim Changelog
 
-## Unreleased — Vehicle meshes that load, and alignment you can see
+## Unreleased — Vehicle meshes that load, SVJ v0.99.2 binding, alignment you can see
 
 - **Static camber and toe now show in the 3D view.** The server used to send
   only the solved suspension motion, so a camber or toe change reached the tyre
@@ -22,6 +22,31 @@
   and which end is the front is read from part names (`bumper_f`, `bonnet`,
   `plate_b`…), falling back to the SVJ §22.4 default. The guess is reported, and
   an Axes selector, opacity slider and optional *Fit to wheels* override it.
+- **SVJ v0.99.2 visual binding: every bound part placed by what it is.**
+  v0.99.2 lets `visual` sit on links, wheels, dual wheels, discs, calipers,
+  springs, dampers, ARBs, steering, powertrain units, driveshafts and aero
+  parts. Before, every binding under a corner was treated as the upright and
+  only the last one per station moved; steering, powertrain and aero bindings
+  were dropped. Now uprights, axle bodies and calipers follow the solved
+  upright; wheels and discs also spin; `placement: "link_between_points"`
+  links sit between their inboard point and the live outboard hardpoint
+  (`mesh_axis`, `from_point`, `scale_to_length` honoured); driveshafts sit
+  joint to joint; everything else rides on the body. A binding without
+  `mesh_ref` uses the file's only mesh. Spec errors (placement on the wrong
+  carrier, a node bound twice, `from_point` out of range) are shown in the
+  viewport; one axle part bound from both its stations is drawn once and not
+  flagged. Checked against the spec's 45-binding
+  `skeleton_visual_binding_dw_corner` example with synthetic meshes: links on
+  their hardpoints to nanometres at the design pose, stretched tie rods
+  exactly on them through a step-steer run.
+- **Fixed: mass-body meshes were offset twice.** The body's `position` was
+  added to a mesh already authored in the vehicle frame (§22.6 `rigid`).
+- **A nested glTF node keeps its parents' transforms.** A node cloned on its
+  own used to lose them, so a part under a moved group landed in the wrong
+  place.
+- **One set of mesh axes per vehicle**, decided from the chassis's asset:
+  §22.4 declares the convention per file, and a small asset (a steering
+  column, four calipers) can't be read from its shape.
 
 ## v0.5.0 — Axle-level kinematics for beam axles
 

@@ -860,7 +860,8 @@ const Viewer = (() => {
     loadArrow.visible = false;
     group.add(loadArrow);
 
-    return { g, group, links, wheel, rim, hub, visualMesh: null, frictionRing, forceArrow, loadArrow };
+    return { g, group, links, wheel, rim, hub, visualParts: [], linkMeshes: [],
+             frictionRing, forceArrow, loadArrow };
   }
 
   function fitCamera(length, width) {
@@ -1101,6 +1102,14 @@ const Viewer = (() => {
     $("meshRow").style.display = (lines.length || declared) ? "" : "none";
   }
 
+  // How each binding moves is decided on the server (find_visual_bindings,
+  // from where the binding sits in the file, SVJ 22.3):
+  //   body     a child of `body`; authored in the vehicle frame, never moved
+  //   station  re-posed every frame with its station's upright (and spun with
+  //            the wheel when `spin`): see articulateStations
+  //   link     laid between its inboard point and its upright hardpoint every
+  //            frame (22.6 link_between_points)
+  //   segment  laid between two fixed points once (a driveshaft)
   async function attachVisualMeshes(data) {
     const assets = data.assets || [];
     const bindings = data.visual_bindings || [];
@@ -1108,109 +1117,272 @@ const Viewer = (() => {
     const assetsById = new Map(assets.map(a => [a.id, a]));
     meshRoots = [];
 
-    // Report every asset the file declares, whether or not anything binds to it.
     assets.filter(a => !a.available).forEach(a =>
       status.push({ bad: true, text: `${a.id}: not loaded - ${a.reason || "unavailable"}` }));
 
-    const placement = new Map();            // asset id -> { pick, offset } shared by all its nodes
+    // Every asset something binds to, loaded once.
+    const scenes = new Map();
+    for (const id of new Set(bindings.map(b => b.mesh_ref))) {
+      const asset = assetsById.get(id);
+      if (!asset || !asset.available) continue;
+      try { scenes.set(id, await loadGltfAsset(asset)); }
+      catch (err) {
+        status.push({ bad: true, text: `${id}: could not be read as glTF - ${err.message || err}` });
+        console.warn(`SVJSim: could not load visual asset "${id}" (${asset.url})`, err);
+      }
+    }
+
+    // One set of axes for the whole vehicle: 22.4 declares the convention per
+    // file, not per asset, and a small asset (a steering column, four
+    // calipers) can't be read from its shape the way a whole car can. The
+    // chassis's asset decides when there is one, otherwise the largest.
+    let pick = null, frameQuat = null, fitOffset = null;
+    if (scenes.size) {
+      const reference = referenceScene(bindings, scenes);
+      pick = pickMeshFrame(data.coordinate_system, reference);
+      frameQuat = pick.key === "declared"
+        ? declaredAxisQuaternion(data.coordinate_system) : FRAME_QUATS[pick.key];
+      if (S.meshFit) fitOffset = meshFitOffset(data, boxInFrame(reference, frameQuat));
+    }
+
+    const tally = new Map();               // asset id -> { placed, missing: [] }
+    const moving = { body: 0, station: 0, link: 0, segment: 0 };
     const wholeModel = new Set();
-    const nodesBound = new Map();
+    const problems = [];
 
     for (const binding of bindings) {
-      const asset = assetsById.get(binding.mesh_ref);
-      if (!asset || !asset.available) continue;
-
-      let scene;
-      try { scene = await loadGltfAsset(asset); }
-      catch (err) {
-        if (!status.some(l => l.text.startsWith(`${asset.id}: could not`))) {
-          status.push({ bad: true, text: `${asset.id}: could not be read as glTF - ${err.message || err}` });
-        }
-        console.warn(`SVJSim: could not load visual asset "${asset.id}" (${asset.url})`, err);
+      if (binding.issue) problems.push(`${binding.node}: ${binding.issue}`);
+      if (binding.duplicate_of) continue;   // drawn once, from its first binding
+      if (binding.kind === "other") {
+        problems.push(`${binding.node}: no defined way to place a part at ${binding.path}`);
         continue;
       }
-      // GLTFLoader sanitizes glTF node names on import (THREE.PropertyBinding
-      // .sanitizeNodeName strips ".:[]/ " so AnimationClip track paths stay
-      // parseable), so SVJ's "SVJ::category::id" convention never survives
-      // load unchanged -- look it up the same way GLTFLoader stored it.
-      const sanitizedName = THREE.PropertyBinding.sanitizeNodeName(binding.node);
-      const node = scene.getObjectByName(binding.node) || scene.getObjectByName(sanitizedName);
+      if (!assetsById.has(binding.mesh_ref)) {
+        if (binding.mesh_ref) problems.push(`${binding.node}: mesh_ref "${binding.mesh_ref}" is not in assets.meshes`);
+        continue;
+      }
+      const scene = scenes.get(binding.mesh_ref);
+      if (!scene) continue;
+      const count = tally.get(binding.mesh_ref) || { placed: 0, missing: [] };
+      tally.set(binding.mesh_ref, count);
+
+      const station = binding.station !== undefined
+        ? stations.find(st => st.g.name === binding.station) : null;
+      if (binding.station !== undefined && !station && binding.kind !== "body") {
+        problems.push(`${binding.node}: station "${binding.station}" is not in the model`);
+        continue;
+      }
+
+      const byHardpoints = binding.kind === "link" || binding.kind === "segment";
+      const node = findNode(scene, binding.node);
       let clone;
       if (node) {
-        clone = node.clone(true);
-        nodesBound.set(asset.id, (nodesBound.get(asset.id) || 0) + 1);
-      } else if (binding.kind === "chassis" && !wholeModel.has(asset.id)) {
+        clone = cloneInAssetFrame(scene, node, byHardpoints);
+      } else if (binding.part === "chassis" && !wholeModel.has(binding.mesh_ref)) {
         // The file asks for a named node the glTF doesn't contain (a file can
         // bind SVJ::body::chassis over a glTF whose parts all have their own
         // names). The vehicle's visual is then
         // the whole model, which is what the binding is for.
         clone = scene.clone(true);
         unplacedParts(clone).forEach(o => { o.visible = false; });
-        wholeModel.add(asset.id);
+        wholeModel.add(binding.mesh_ref);
       } else {
+        count.missing.push(binding.node);
+        continue;
+      }
+      count.placed++;
+      moving[binding.kind]++;
+
+      if (byHardpoints) {
+        const part = hardpointPart(clone, binding, frameQuat, station);
+        if (binding.kind === "segment") {
+          placeBetween(part, binding.from, binding.to);
+          body.add(part.holder);
+        } else {
+          station.group.add(part.holder);
+          station.linkMeshes.push(part);
+          station.links.filter(l => l.spec.name === binding.name).forEach(l => ghost(l.lines));
+        }
+        meshRoots.push(part.holder);
         continue;
       }
 
-      if (!placement.has(asset.id)) {
-        placement.set(asset.id, { pick: pickMeshFrame(data.coordinate_system, scene), offset: null });
-      }
-      const place = placement.get(asset.id);
       const axisGroup = new THREE.Group();
-      axisGroup.quaternion.copy(place.pick.key === "declared"
-        ? declaredAxisQuaternion(data.coordinate_system) : FRAME_QUATS[place.pick.key]);
+      axisGroup.quaternion.copy(frameQuat);
       axisGroup.add(clone);
+      if (fitOffset) axisGroup.position.copy(fitOffset);
 
-      if (S.meshFit) {
-        if (!place.offset) place.offset = meshFitOffset(data, axisGroup);
-        axisGroup.position.copy(place.offset);
-      }
-
-      if (binding.kind === "chassis") {
-        body.add(axisGroup);
-        ghost(chassisBox); ghost(chassisEdges);
-      } else if (binding.kind === "station") {
-        const station = stations.find(s => s.g.name === binding.station);
-        if (!station) continue;
+      if (binding.kind === "station") {
         const poseGroup = new THREE.Group();
         poseGroup.add(axisGroup);
         station.group.add(poseGroup);
-        station.visualMesh = poseGroup;
-        ghost(station.wheel); ghost(station.rim); ghost(station.hub);
-      } else if (binding.kind === "mass_body" && binding.position) {
-        axisGroup.position.add(toThree(binding.position));
-        body.add(axisGroup);
+        station.visualParts.push({ group: poseGroup, spin: !!binding.spin });
+        if (binding.legacy_corner) { ghost(station.wheel); ghost(station.rim); ghost(station.hub); }
+        else if (binding.part === "upright") ghost(station.hub);
+        else if (binding.part === "wheel") { ghost(station.wheel); ghost(station.rim); }
       } else {
-        continue;                          // kind "other": no pose to give it yet
+        body.add(axisGroup);
+        if (binding.part === "chassis") { ghost(chassisBox); ghost(chassisEdges); }
       }
       meshRoots.push(axisGroup);
     }
 
-    placement.forEach((place, id) => {
-      const how = wholeModel.has(id)
-        ? "whole model shown (the file has no SVJ:: nodes to pick parts from)"
-        : `${nodesBound.get(id) || 0} named part(s) placed`;
-      const frame = FRAME_LABELS[place.pick.key] +
-        (place.pick.guessed ? ` (guessed${place.pick.how ? " " + place.pick.how : ""})` : "");
-      status.push({ bad: false, text: `${id}: ${how}; axes ${frame}${S.meshFit ? "; fitted to wheels" : ""}` });
-    });
-    bindings.forEach(b => {
-      const a = assetsById.get(b.mesh_ref);
-      if (a && a.available && !placement.has(a.id) && !status.some(l => l.text.startsWith(`${a.id}:`))) {
-        status.push({ bad: true, text: `${a.id}: loaded, but its node "${b.node}" is not in the file` });
+    if (pick) {
+      const guess = pick.guessed ? ` (guessed${pick.how ? " " + pick.how : ""})` : "";
+      status.push({ bad: false, text: `axes: ${FRAME_LABELS[pick.key]}${guess}${fitOffset ? "; fitted to wheels" : ""}` });
+    }
+    tally.forEach((count, id) => {
+      if (wholeModel.has(id)) {
+        status.push({ bad: false, text: `${id}: whole model shown (the file has no SVJ:: nodes to pick parts from)` });
+      } else if (count.placed) {
+        status.push({ bad: false, text: `${id}: ${count.placed} part(s) placed` });
+      }
+      if (count.missing.length) {
+        const shown = count.missing.slice(0, 2).join(", ");
+        status.push({ bad: true, text: `${id}: ${count.missing.length} bound node(s) not in the file` +
+          ` (${shown}${count.missing.length > 2 ? ", ..." : ""})` });
       }
     });
+    const placed = moving.body + moving.station + moving.link + moving.segment;
+    if (placed > 1 && (moving.station || moving.link)) {
+      status.push({ bad: false, text: `${moving.station} moving with the wheels, ${moving.link} on link ` +
+        `hardpoints, ${moving.body + moving.segment} fixed to the body` });
+    }
+    problems.slice(0, 4).forEach(text => status.push({ bad: true, text }));
+    if (problems.length > 4) status.push({ bad: true, text: `...and ${problems.length - 4} more binding problem(s)` });
+
     meshRoots.forEach(r => applyMeshOpacity(r, S.meshOpacity));
     setMeshStatus(status);
   }
 
-  // Where to move a mesh so its footprint sits on the vehicle: centred on the
-  // wheel-centre box in x and y, with its lowest point on the ground. Off by
-  // default and only on request: an origin that doesn't match is exactly the
-  // sort of discrepancy this overlay exists to show, so it is never quietly
-  // corrected; "Fit" is for when you want to look past it.
-  function meshFitOffset(data, axisGroup) {
-    axisGroup.updateMatrixWorld(true);
-    const box = new THREE.Box3().setFromObject(axisGroup);
+  function findNode(scene, name) {
+    // GLTFLoader sanitizes glTF node names on import (THREE.PropertyBinding
+    // .sanitizeNodeName strips ".:[]/ " so AnimationClip track paths stay
+    // parseable), so SVJ's "SVJ::category::id" convention never survives
+    // load unchanged -- look it up the same way GLTFLoader stored it.
+    return scene.getObjectByName(name) ||
+      scene.getObjectByName(THREE.PropertyBinding.sanitizeNodeName(name));
+  }
+
+  // A node cloned on its own loses its parents' transforms; give it back its
+  // whole transform within the asset, so a part nested under a group still
+  // lands where the asset puts it. For a part placed by hardpoints (22.6) it
+  // is the node's OWN frame that the binding talks about ("mesh_axis is an
+  // axis of the mesh's own local frame"), so only its scale is kept.
+  function cloneInAssetFrame(scene, node, ownFrame) {
+    scene.updateMatrixWorld(true);       // the cached scene root is never moved
+    const position = new THREE.Vector3(), quaternion = new THREE.Quaternion(), scale = new THREE.Vector3();
+    node.matrixWorld.decompose(position, quaternion, scale);
+    const clone = node.clone(true);
+    clone.position.copy(ownFrame ? new THREE.Vector3() : position);
+    clone.quaternion.copy(ownFrame ? new THREE.Quaternion() : quaternion);
+    clone.scale.copy(scale);
+    return clone;
+  }
+
+  function referenceScene(bindings, scenes) {
+    const chassis = bindings.find(b => b.part === "chassis" && scenes.has(b.mesh_ref));
+    if (chassis) return scenes.get(chassis.mesh_ref);
+    let best = null, bestSize = -1;
+    scenes.forEach(scene => {
+      scene.updateMatrixWorld(true);
+      const size = new THREE.Box3().setFromObject(scene).getSize(new THREE.Vector3()).length();
+      if (size > bestSize) { best = scene; bestSize = size; }
+    });
+    return best;
+  }
+
+  // ── Parts placed by hardpoints (SVJ 22.6, link_between_points) ─────────
+  //
+  // The node's own origin goes to the inboard end, and its `mesh_axis` is
+  // turned onto the inboard->outboard direction. The spec leaves the roll
+  // about that axis to the renderer; this one keeps the asset's own "up" as
+  // close to the vehicle's up as the link direction allows (the asset's
+  // forward instead, for a link that is itself nearly vertical). That choice
+  // is made once, at the design pose, so the part never flips mid-travel, and
+  // it gives a part authored flat in its own frame the same roll in every
+  // renderer that follows the same rule.
+  const MESH_AXES = {
+    "+x": new THREE.Vector3(1, 0, 0), "-x": new THREE.Vector3(-1, 0, 0),
+    "+y": new THREE.Vector3(0, 1, 0), "-y": new THREE.Vector3(0, -1, 0),
+    "+z": new THREE.Vector3(0, 0, 1), "-z": new THREE.Vector3(0, 0, -1),
+  };
+  const UP3 = new THREE.Vector3(0, 1, 0);        // toThree([0, 0, -1]): SVJ up
+  const FORWARD3 = new THREE.Vector3(1, 0, 0);   // toThree([1, 0, 0])
+
+  function hardpointPart(clone, binding, frameQuat, station) {
+    const axis = (MESH_AXES[binding.mesh_axis] || MESH_AXES["+x"]).clone();
+    const toLocal = frameQuat.clone().invert();
+    const upLocal = UP3.clone().applyQuaternion(toLocal);
+    const forwardLocal = FORWARD3.clone().applyQuaternion(toLocal);
+
+    const scaler = new THREE.Group();
+    scaler.add(clone);
+    const holder = new THREE.Group();
+    holder.add(scaler);
+
+    // How far the authored mesh reaches along its axis from its own origin,
+    // which is what has to land on the outboard point when stretched.
+    let span = 0;
+    if (binding.scale_to_length) {
+      clone.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(clone);
+      span = Math.max(axis.x * (axis.x > 0 ? box.max.x : box.min.x),
+                      axis.y * (axis.y > 0 ? box.max.y : box.min.y),
+                      axis.z * (axis.z > 0 ? box.max.z : box.min.z));
+    }
+
+    const designTo = binding.kind === "segment" ? binding.to
+      : (station && station.g.hardpoints[binding.outboard]);
+    const design = designTo ? toThree(designTo).sub(toThree(binding.kind === "segment" ? binding.from : binding.inboard)).normalize()
+      : FORWARD3.clone();
+    const nearlyVertical = Math.abs(axis.dot(upLocal)) > 0.95 || Math.abs(design.dot(UP3)) > 0.95;
+    return {
+      holder, scaler, axis, span, binding,
+      refLocal: nearlyVertical ? forwardLocal : upLocal,
+      refTarget: nearlyVertical ? FORWARD3 : UP3,
+    };
+  }
+
+  function placeBetween(part, from, to) {
+    const a = toThree(from);
+    const direction = toThree(to).sub(a);
+    const length = direction.length();
+    if (length < 1e-9) return;
+    direction.divideScalar(length);
+    const basis = (main, ref) => {
+      const second = ref.clone().sub(main.clone().multiplyScalar(ref.dot(main))).normalize();
+      return new THREE.Matrix4().makeBasis(main, second, new THREE.Vector3().crossVectors(main, second));
+    };
+    const source = basis(part.axis, part.refLocal);
+    const target = basis(direction, part.refTarget);
+    part.holder.quaternion.setFromRotationMatrix(target.multiply(source.transpose()));
+    part.holder.position.copy(a);
+    if (part.span > 1e-6) {
+      const stretch = length / part.span;
+      part.scaler.scale.set(part.axis.x ? stretch : 1, part.axis.y ? stretch : 1, part.axis.z ? stretch : 1);
+    }
+  }
+
+  // The reference asset's box once turned into the vehicle frame. Every
+  // FRAME_QUATS entry is a quarter-turn rotation, so turning the corners of
+  // the asset's own box gives the exact box rather than an inflated one.
+  function boxInFrame(scene, quaternion) {
+    scene.updateMatrixWorld(true);
+    const own = new THREE.Box3().setFromObject(scene);
+    const out = new THREE.Box3();
+    [own.min.x, own.max.x].forEach(x => [own.min.y, own.max.y].forEach(y => [own.min.z, own.max.z].forEach(z =>
+      out.expandByPoint(new THREE.Vector3(x, y, z).applyQuaternion(quaternion)))));
+    return out;
+  }
+
+  // Where to move the meshes so the vehicle's footprint sits on its wheels:
+  // centred on the wheel-centre box in x and y, with the lowest point on the
+  // ground. Off by default and only on request: an origin that doesn't match
+  // is exactly the sort of discrepancy this overlay exists to show, so it is
+  // never quietly corrected; "Fit" is for when you want to look past it.
+  // One offset for the whole vehicle, since its assets share one frame.
+  function meshFitOffset(data, box) {
     const centre = box.getCenter(new THREE.Vector3());
     const geo = data.geometry || [];
     if (!geo.length) return new THREE.Vector3();
@@ -1353,7 +1525,7 @@ const Viewer = (() => {
         new THREE.Vector3(0, 1, 0), spinOf ? -spinOf(g.name) : 0);
       s.wheel.quaternion.copy(align).multiply(spin);
 
-      if (s.visualMesh) {
+      if (s.visualParts.length) {
         // A station's mesh node (unlike the procedural hub/wheel, which has
         // no shape of its own) already sits where its author put it in the
         // shared vehicle-frame asset: often the whole car modelled together
@@ -1375,15 +1547,45 @@ const Viewer = (() => {
         // visible camber change.)
         const design = poseAt(g, 0, 0);
         const designQuaternion = rodrigues(design.theta);
-        const align = new THREE.Quaternion().multiplyQuaternions(
+        const alignChange = new THREE.Quaternion().multiplyQuaternions(
           new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), g.mesh_toe_delta || 0),
           new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), g.mesh_camber_delta || 0));
-        const total = align.multiply(quaternion.clone().multiply(designQuaternion.clone().invert()));
-        const total3 = conjugateIntoThree(total);
+        const total = alignChange.multiply(quaternion.clone().multiply(designQuaternion.clone().invert()));
         const designCentre = [origin[0] + design.d[0], origin[1] + design.d[1], origin[2] + design.d[2]];
-        s.visualMesh.quaternion.copy(total3);
-        s.visualMesh.position.copy(toThree(centre)).sub(toThree(designCentre).applyQuaternion(total3));
+        const centreThree = toThree(centre), designThree = toThree(designCentre);
+
+        // Wheels and discs also turn about their axle: the design-pose axis
+        // with the FILE's static alignment (current offset minus the change
+        // since), which is the axis a mesh authored to match the file sits
+        // on. Spun about that first, then carried by the same change as the
+        // upright. A mesh authored with different camber or toe than the
+        // file declares therefore visibly wobbles as it turns, which is the
+        // discrepancy showing, not a fault in the spin.
+        let spun = null;
+        if (spinOf && s.visualParts.some(part => part.spin)) {
+          const designAxis = new THREE.Vector3(0, 1, 0).applyQuaternion(designQuaternion);
+          const camber = Math.asin(Math.max(-1, Math.min(1, designAxis.z))) +
+            (g.camber_offset || 0) - (g.mesh_camber_delta || 0);
+          const steer = Math.atan2(-designAxis.x, designAxis.y) + (g.toe_offset || 0) - (g.mesh_toe_delta || 0);
+          const meshAxis = new THREE.Vector3(-Math.sin(steer) * Math.cos(camber),
+                                             Math.cos(steer) * Math.cos(camber), Math.sin(camber));
+          const spin = new THREE.Quaternion().setFromAxisAngle(meshAxis.normalize(), -spinOf(g.name));
+          spun = conjugateIntoThree(total.clone().multiply(spin));
+        }
+        const fixed = conjugateIntoThree(total);
+        s.visualParts.forEach(part => {
+          const q = part.spin && spun ? spun : fixed;
+          part.group.quaternion.copy(q);
+          part.group.position.copy(centreThree).sub(designThree.clone().applyQuaternion(q));
+        });
       }
+
+      // Links bound with link_between_points (22.6) follow their two ends:
+      // the inboard point on the body, the hardpoint on the moving upright.
+      s.linkMeshes.forEach(part => {
+        const hardpoint = g.hardpoints[part.binding.outboard];
+        if (hardpoint) placeBetween(part, part.binding.inboard, movePoint(hardpoint, origin, p, quaternion));
+      });
 
       const forces = forcesOf ? forcesOf(g.name) : null;
       if (forces && forces.grip > 1) {
