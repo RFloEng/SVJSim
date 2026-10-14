@@ -38,19 +38,16 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .joints import (BEAM_TOPOLOGIES, CARRIER_TOPOLOGIES, JointPair, LinkPlan,  # noqa: F401
+                     plan_link, resolve_joints)
 from .util import dig, num, vec3
 
-# Topologies where an `arm` link rigidly carries the upright, making the
-# station a single revolute joint rather than a linkage to be solved.
-CARRIER_TOPOLOGIES = frozenset({
-    "trailing_arm", "semi_trailing_arm", "torsion_beam",
-    "swing_axle", "pendulum_axle",
-})
-
-# Axles where one rigid body spans both wheels. Each side's links do not locate
-# its own upright — the beam does — so an under-constrained solve is expected
-# here, and camber is resolved from the axle's roll instead (see `model.py`).
-BEAM_TOPOLOGIES = frozenset({"solid_axle", "de_dion"})
+# `CARRIER_TOPOLOGIES` (topologies where an `arm` link normally carries the
+# upright rigidly, making the station a single revolute joint rather than a
+# linkage to be solved) and `BEAM_TOPOLOGIES` (axles where one rigid body spans
+# both wheels, so each side's links do not locate its own upright and camber is
+# resolved from the axle's roll, see `model.py`) now live in `joints.py`, next to
+# the joint types that decide which link is which.
 
 # Upright hardpoints an arm/rod link may drive, in the order we prefer them
 # when a link does not name its `outboard_ref` explicitly.
@@ -113,11 +110,25 @@ class Link:
     outboard_ref: str = ""
     steered: bool = False          # inboard point translates with the rack
     carrier: bool = False          # rigidly carries the upright (revolute mode)
+    carrier_hangs: bool = False    # pinned model: the upright hangs from the pickup
     strut_axis: np.ndarray | None = None
     lengths: list[float] = field(default_factory=list)
+    model: str = "distance"        # how it constrains the upright, see joints.py
+    axis: np.ndarray | None = None  # pivot / joint axis (revolute_pair, cylinder), unit
+    pin: np.ndarray | None = None   # the point held fixed in space (pinned)
+    demoted_carrier: bool = False   # the topology says carrier, the joint says not
 
     def __post_init__(self) -> None:
         self.lengths = [float(np.linalg.norm(self.outboard - p)) for p in self.inboard]
+        if self.model in ("revolute_pair", "cylinder") and self.axis is None:
+            axis = (self.inboard[1] - self.inboard[0]) if len(self.inboard) >= 2 \
+                else np.array([0.0, 1.0, 0.0])
+            n = float(np.linalg.norm(axis))
+            self.axis = axis / n if n > 1e-9 else np.array([0.0, 1.0, 0.0])
+        if self.model == "pinned" and self.pin is None:
+            # A link rigid with the chassis ends in a ball joint that cannot move;
+            # a rigid upright hung from one pickup cannot move that pickup.
+            self.pin = self.inboard[0] if self.carrier_hangs else self.outboard
         if self.kind == "strut" and self.strut_axis is None and self.inboard:
             axis = self.outboard - self.inboard[0]
             n = np.linalg.norm(axis)
@@ -145,6 +156,30 @@ class Link:
             perp = w - float(w @ u_hat) * u_hat
             e1, e2 = _basis_perpendicular(self.strut_axis)
             return np.array([float(perp @ e1), float(perp @ e2)])
+
+        if self.model == "pinned":
+            return pose_point.transform(self.pin) - self.pin
+
+        if self.model == "cylinder":
+            # An arm that may also slide along its pivot axis: only the distance
+            # from that axis is held.
+            rel = out - inb[0]
+            rel0 = self.outboard - self.inboard[0]
+            radial = lambda r: float(np.linalg.norm(r - float(r @ self.axis) * self.axis))
+            return np.array([radial(rel) - radial(rel0)])
+
+        if self.model == "revolute_pair":
+            # Revolute at both ends with parallel axes: the upright turns only
+            # about the axis (two rotation constraints), and the outboard joint
+            # stays in its plane and at its distance from the axis.
+            rel = out - inb[0]
+            rel0 = self.outboard - self.inboard[0]
+            along = lambda r: float(r @ self.axis)
+            radial = lambda r: float(np.linalg.norm(r - along(r) * self.axis))
+            e1, e2 = _basis_perpendicular(self.axis)
+            axis_now = rotation_vector_matrix(pose_point.theta) @ self.axis
+            return np.array([along(rel) - along(rel0), radial(rel) - radial(rel0),
+                             float(axis_now @ e1), float(axis_now @ e2)])
 
         # Arms and rods hold their outboard joint at a fixed distance from each
         # inboard pickup; two spheres intersect in the arc an A-arm sweeps.
@@ -221,6 +256,7 @@ class StationKinematics:
         self.corner = corner
         self.topology = str(dig(corner, "topology", "system_type", default="custom"))
         self.warnings: list[str] = []
+        self.notes: list[str] = []
 
         hardpoints = dig(corner, "topology", "upright", "hardpoints", default={}) or {}
         self.hardpoints = {
@@ -239,7 +275,9 @@ class StationKinematics:
         self.active: list[tuple[int, int]] = []
         self._axis_cache: tuple[np.ndarray, np.ndarray] | None = None
         if self.mode == "link":
+            mark = len(self.warnings)
             self._select_constraints()
+            self._reinstate_carrier(mark)
 
         self.spring_mounts = self._mount_pair("spring")
         self.damper_mounts = self._mount_pair("damper")
@@ -324,7 +362,6 @@ class StationKinematics:
 
     def _build_links(self) -> list[Link]:
         links: list[Link] = []
-        carrier_topology = self.topology in CARRIER_TOPOLOGIES
         for spec in dig(self.corner, "topology", "links", default=[]) or []:
             name = str(spec.get("name", "link"))
             kind = str(spec.get("type", "arm"))
@@ -340,12 +377,49 @@ class StationKinematics:
                     f"('{ref}') or no inboard points — ignored")
                 continue
             steered = "tie_rod" in name.lower() or key == "steering_tie_rod_end"
-            carrier = carrier_topology and kind == "arm" and key == "wheel_center"
-            links.append(Link(name=name, kind=kind, inboard=inboard, outboard=outboard,
-                              outboard_ref=key, steered=steered, carrier=carrier))
+
+            # The joints at both ends decide how this link constrains the upright;
+            # explicit `joint_type`/`inboard_joint_type` win over the spec's table.
+            issues: list[str] = []
+            joints = resolve_joints(spec, self.topology, issues)
+            self.warnings.extend(f"{self.station}: link '{name}': {m}" for m in issues)
+            plan = plan_link(kind=kind, joints=joints, inboard_count=len(inboard),
+                             at_wheel_center=(key == "wheel_center"), system_type=self.topology)
+            self._note_plan(name, joints, plan)
+            links.append(Link(
+                name=name, kind=kind, inboard=inboard, outboard=outboard,
+                outboard_ref=key, steered=steered, carrier=(plan.model == "carrier"),
+                carrier_hangs=(plan.model == "pinned" and joints.outboard == "fixed"),
+                model=plan.model, demoted_carrier=plan.demoted_carrier))
         if not links:
             self.warnings.append(f"{self.station}: no usable links — treated as rigid")
         return links
+
+    def _note_plan(self, name: str, joints: JointPair, plan: LinkPlan) -> None:
+        """Say what the joints made of a link when that is not the plain default.
+
+        Worded by link and joints, not by station, so the same situation on four
+        wheels collapses to one line in the build report.
+        """
+        pair = ", ".join(text for text in (
+            f"{joints.inboard} inboard" if joints.inboard else "",
+            f"{joints.outboard} outboard" if joints.outboard else "") if text) or "no joints"
+        explicit = "explicit" in (joints.inboard_source, joints.outboard_source)
+        meaning = {
+            "carrier": "carries the upright rigidly and pivots about its inboard axis",
+            "revolute_pair": "turns the upright only about its parallel pivot axis",
+            "cylinder": "may slide along its pivot axis, so only the distance from it is held",
+            "pinned": "pins a point of the upright in space",
+        }.get(plan.model)
+        # A carrier is what a trailing arm always was; only say so when the
+        # file's own joints, rather than the topology, are what made it one.
+        if meaning and (plan.model != "carrier" or explicit):
+            self.notes.append(f"link '{name}' ({pair}, {'stated' if explicit else 'inferred'}) "
+                              f"{meaning}")
+        if plan.lateral_axis_assumed:
+            self.notes.append(f"link '{name}': one inboard point gives no pivot axis, so a lateral "
+                              "(+Y) axis is assumed")
+        self.notes.extend(f"link '{name}': {m}" for m in plan.notes)
 
     def _all_residuals(self, pose: UprightPose, rack: float) -> np.ndarray:
         if not self.links:
@@ -372,10 +446,18 @@ class StationKinematics:
         total = len(active) + len(dropped)
         if dropped:
             names = sorted({self.links[li].name for li, _ in dropped})
-            self.warnings.append(
-                f"{self.station}: {total} link constraints for a 5-constraint linkage — "
-                f"redundant ones on {', '.join(names)} dropped. The topology is "
-                f"over-defined; a true multi-link wants `rod` links, not `arm` links")
+            if {self.links[li].model for li, _ in dropped} == {"revolute_pair"}:
+                # Beams pivoting about parallel axes (a parallelogram) give the
+                # same rotation and plane constraints each; sharing them is what
+                # makes the linkage a parallelogram, not a mistake in the file.
+                self.notes.append(
+                    f"parallel pivot axes: {len(dropped)} constraint(s) on {', '.join(names)} "
+                    f"duplicate the other links' rotation and plane constraints and are dropped")
+            else:
+                self.warnings.append(
+                    f"{self.station}: {total} link constraints for a 5-constraint linkage — "
+                    f"redundant ones on {', '.join(names)} dropped. The topology is "
+                    f"over-defined; a true multi-link wants `rod` links, not `arm` links")
         # Independent from the above, not `elif`: dropping constraints as
         # redundant (just above) and coming up short of 5 independent ones
         # (here) are different failures that can happen together — e.g. two
@@ -387,6 +469,34 @@ class StationKinematics:
                 f"{self.station}: only {len(active)} independent link constraints "
                 f"(5 expected) — the upright is under-located and free directions "
                 f"are held at their design values")
+
+    def _reinstate_carrier(self, mark: int) -> None:
+        """Fall back to the topology's carrier arm when its joint leaves the upright loose.
+
+        A trailing or semi-trailing arm whose outboard joint is stated as a
+        ball joint does not, by itself, hold the upright's orientation. If the
+        station's other links do not either, the file would solve to an upright
+        free to turn, which is certainly not what it describes: the arm is taken
+        as carrying the upright, as for any such topology, and the build report
+        says the joint was overruled.
+        """
+        if len(self.active) >= 5 or self.topology in BEAM_TOPOLOGIES:
+            return
+        demoted = next((l for l in self.links if l.demoted_carrier), None)
+        if demoted is None:
+            return
+        independent = len(self.active)
+        # What the constraint pick just said about this station no longer applies.
+        del self.warnings[mark:]
+        demoted.carrier = True
+        demoted.model = "carrier"
+        self.mode = "revolute"
+        self.active = []
+        self.warnings.append(
+            f"{self.station}: link '{demoted.name}' states a spherical outboard joint, which would "
+            f"leave the upright unlocated ({independent} independent constraints from the "
+            f"station's links); it is treated as carrying the upright, as a "
+            f"{self.topology.replace('_', ' ')} does")
 
     def _mount_pair(self, section: str) -> tuple[np.ndarray, np.ndarray, str] | None:
         """Return (inboard, outboard, attachment) for a spring or damper."""

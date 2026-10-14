@@ -1,6 +1,6 @@
 # SVJSim Changelog
 
-## Unreleased — SVJ v0.99.3: differential control, and a driveline that follows the file
+## Unreleased — SVJ v0.99.3: differential control, joint types, and a driveline that follows the file
 
 - **`lock_control` (SVJ §10.8.1) is simulated.** Chains of stages (input → curve
   → multiply/add, with a low-pass `filter_time_constant` and `min`/`max`
@@ -25,6 +25,27 @@
   `drive_torque_<station>` channels. MX-5 results are unchanged (0–100 km/h
   6.01 s, standing 400 m 14.21 s).
 
+- **`joint_type` and `inboard_joint_type` (SVJ §9.2.3.2) decide how a link
+  constrains its upright.** Explicit values win; missing ones come from the
+  spec's inference table (kept in step with `svj.multibody` by a test). The
+  common combinations behave as before: a rod, or an A-arm with a revolute
+  inboard and ball outboard, holds its distances; a strut keeps its axis
+  through the top mount. What changes, and only for files that state or imply
+  something else: a `fixed` outboard joint makes the arm carry the upright
+  rigidly whichever hardpoint it attaches at (a trailing arm bolted at an axle
+  seat, previously solved as a lone distance and left under-located); a
+  `pivot` link with a revolute outboard turns the upright about its pin
+  (pendulum axles, likewise under-located before); revolute joints at both
+  ends with parallel axes keep a parallelogram's housing level and move its
+  wheel on the beams' arc; a `cylindrical` inboard joint lets the arm slide
+  along its axis; a link rigid with the chassis pins its ball joint. A ball
+  joint stated on a trailing arm that nothing else locates is overruled, with a
+  warning, rather than leaving the upright free. Joint axes are not in SVJ: they
+  come from the two inboard points, otherwise a lateral axis is assumed, and
+  joints SVJSim cannot turn into a constraint (`universal`, `planar`, ...) are
+  reduced to the position they imply, all reported in the build notes. Of the
+  26 bundled examples, three change (the two trailers and the parallelogram
+  truck); the other 23, including the MX-5, are identical.
 ## Unreleased — Vehicle meshes that load, SVJ v0.99.2 binding, alignment you can see
 
 - **Static camber and toe now show in the 3D view.** The server used to send

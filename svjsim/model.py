@@ -890,6 +890,7 @@ def build_vehicle(source: Any, *, prefer_tire: str | None = None,
             solvers[left_name], solvers[right_name] = left_solver, right_solver
             axle_roll_centre_z[left_name] = axle_roll_centre_z[right_name] = roll_centre_z
             report.extend(left_solver.warnings + right_solver.warnings + axle.warnings)
+            report.extend(left_solver.notes + right_solver.notes, "notes")
             handled.add(left_name)
             handled.add(right_name)
             continue
@@ -897,6 +898,7 @@ def build_vehicle(source: Any, *, prefer_tire: str | None = None,
         tables[name] = solver.build_table()
         solvers[name] = solver
         report.extend(solver.warnings)
+        report.extend(solver.notes, "notes")
 
     # -- masses ---------------------------------------------------------------
     stations: list[Station] = []

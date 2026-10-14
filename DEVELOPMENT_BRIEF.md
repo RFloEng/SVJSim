@@ -130,6 +130,24 @@ once at the design pose so a part never flips mid-travel. All assets of one
 file share one set of axes (§22.4 is per file), decided from the chassis's
 asset, because a small asset can't be read from its shape.
 
+### Link joint types
+
+A link's two joints (`inboard_joint_type`, `joint_type`) are resolved in
+`joints.py` (explicit, else the spec's inference table) and `plan_link` turns
+them into one of six constraint models on the upright: `distance` (rods and
+ordinary A-arms), `strut`, `carrier` (the upright is rigid with an arm pivoting
+about its inboard axis, solved as one angle), `revolute_pair` (parallel
+revolute axes at both ends: a parallelogram), `cylinder` and `pinned`. SVJ gives
+hardpoints but no joint axes, so an axis comes from the two inboard points and
+is otherwise assumed lateral (+Y); a joint that cannot be turned into a
+constraint is reduced to the distance it implies and the build notes say so.
+Two rules keep this safe: a link's own topology default still applies when its
+joints are neither stated nor inferable (a swing axle's arm), and a ball joint
+that would leave a trailing arm's upright unlocated is overruled, with a
+warning. Beam-axle links stay plain distances. `tests/test_joints.py` checks
+each model against hand-calculated geometry and the inference table against
+`svj.multibody`.
+
 ### The driveline
 
 `driveline.py` turns the powertrain block into three stages, applied inside
@@ -262,6 +280,12 @@ roll-centre heights or anti-percentages anywhere in the code.
   that use them — a different problem from the axle kinematics above (this
   one is mass/spring load-sharing *between* axles, via a rocker, beam or
   fluid circuit, not the rigid-body kinematics *within* one axle).
+- **Joint axes and some joint types are not modelled.** SVJ gives no axes, so a
+  single-pickup revolute joint assumes a lateral one; `universal`, `hooke`,
+  `planar` and a revolute outboard behind a ball-joint pickup keep only the
+  position they imply; `translational`/`cylindrical` outboard joints count
+  only on struts. A pendulum axle's two wheels are solved independently about
+  the pin rather than as the one rigid axle they are.
 - **One overall ratio for the whole driveline.** Axle differentials with
   different final drives are reported and the first one's is used; a centre
   device is modelled between exactly two driven axles (with more, torque is
