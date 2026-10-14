@@ -71,6 +71,20 @@ def num(doc: Any, *path: str | int, default: float | None = None) -> float | Non
     return val if np.isfinite(val) else default
 
 
+def point3(value: Any) -> list[float] | None:
+    """One SVJ point as `[x, y, z]`, whether it was written as an array or as a
+    v0.96 marker `{position, orientation}`; None if it is neither."""
+    if isinstance(value, dict):
+        value = value.get("position")
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    try:
+        point = [float(c) for c in value]
+    except (TypeError, ValueError):
+        return None
+    return point if all(np.isfinite(point)) else None
+
+
 def vec3(doc: Any, *path: str | int, default: Sequence[float] | None = None) -> np.ndarray | None:
     """Read an `[x, y, z]` array. SVJ v0.96 also allows `{position, orientation}`."""
     val = dig(doc, *path, default=None)

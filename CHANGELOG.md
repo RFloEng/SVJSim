@@ -1,5 +1,30 @@
 # SVJSim Changelog
 
+## Unreleased — SVJ v0.99.3: differential control, and a driveline that follows the file
+
+- **`lock_control` (SVJ §10.8.1) is simulated.** Chains of stages (input → curve
+  → multiply/add, with a low-pass `filter_time_constant` and `min`/`max`
+  clamps) modulate `lock`, `lock_power`, `lock_coast` or `preload` from gear,
+  brake, throttle, speed, axle speed ratio, an oversteer indicator and axle
+  slip angles; an array gives separate power and coast chains. The filters are
+  integrated with the vehicle state, so they follow `exp(-t/τ)` exactly.
+- **`transfer_case.coupling` and `center_diff` are simulated.** Before, the
+  shaft torque was shared equally between every driven wheel, whatever the
+  file said. Now there is a centre stage (fixed split, centre differential, or
+  a torque-limited coupling whose capacity rises from `ramp_torque` to
+  `max_torque`) followed by one differential per axle.
+- **Fixed: cars that declare no `half_shafts` had no driven wheels.** Seven
+  bundled examples (RWD, FWD and 4WD) could not accelerate; the driven wheels
+  now come from the layout / `drive_type`, then from where the differentials
+  sit, and the build report says which.
+- **Fixed: trucks ran with a final drive of 1.** The inter-axle differential,
+  which has no final drive, was taken for the axle's.
+- **Fixed: marker-form points (`{position, orientation}`) vanished from the
+  3D view.** The solver read them, the viewer's geometry did not.
+- `svjsim info` shows the centre device and lock control; telemetry gains
+  `drive_torque_<station>` channels. MX-5 results are unchanged (0–100 km/h
+  6.01 s, standing 400 m 14.21 s).
+
 ## Unreleased — Vehicle meshes that load, SVJ v0.99.2 binding, alignment you can see
 
 - **Static camber and toe now show in the 3D view.** The server used to send

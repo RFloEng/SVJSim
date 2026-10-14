@@ -133,3 +133,38 @@ def test_driveshaft_between_its_joints(bound):
     assert shaft["kind"] == "segment"
     assert shaft["from"] == [-0.5, 0.0, -0.30] and shaft["to"] == [-2.3, 0.0, -0.28]
     assert shaft["mesh_axis"] == "+x" and shaft["scale_to_length"] is True
+
+
+def _as_markers(point):
+    return {"position": point, "orientation": [0.0, 0.0, 0.0, 1.0]}
+
+
+def test_marker_form_points_reach_the_viewer(document):
+    """v0.96 marker points `{position, orientation}` are read by the solver, so
+    the geometry sent to the 3D view has to carry them too, not drop the link."""
+    import copy
+
+    from svjsim.model import build_vehicle
+    from svjsim.server import _station_geometry
+
+    marked = copy.deepcopy(document)
+    topology = marked["suspension"]["FL"]["topology"]
+    upright = topology["upright"]["hardpoints"]
+    for name in list(upright):
+        upright[name] = _as_markers(upright[name])
+    for link in topology["links"]:
+        link["inboard_points"] = [_as_markers(p) for p in link["inboard_points"]]
+
+    plain, with_markers = build_vehicle(document), build_vehicle(marked)
+    expected = _station_geometry(plain, plain.stations[0])
+    got = _station_geometry(with_markers, with_markers.stations[0])
+    assert got["hardpoints"] == expected["hardpoints"] and got["hardpoints"]
+    assert got["links"] == expected["links"] and len(got["links"]) == 3
+
+
+def test_link_between_points_reads_marker_inboard_points(bound):
+    links = bound["suspension"]["FL"]["topology"]["links"]
+    expected = _by_node(find_visual_bindings(bound))["SVJ::suspension::upper_wishbone_fl"]["inboard"]
+    links[0]["inboard_points"] = [_as_markers(p) for p in links[0]["inboard_points"]]
+    got = _by_node(find_visual_bindings(bound))["SVJ::suspension::upper_wishbone_fl"]
+    assert got["kind"] == "link" and got["inboard"] == pytest.approx(expected)

@@ -29,6 +29,8 @@ from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
+from .driveline import (CentreSpec, Differential, axle_number, infer_driven,
+                        parse_centre, parse_differential)
 from .kinematics import (AxleKinematics, KCTable, StationKinematics, from_svj_camber,
                          from_svj_toe, side_sign)
 from .tires import TireModel, build_tire
@@ -340,16 +342,20 @@ class Engine:
 
 @dataclass
 class Driveline:
-    """Gearbox, final drive and differential, reduced to what the solver needs."""
+    """Gearbox, final drive and the layout downstream of it, reduced to what the
+    solver needs. `axle_diffs` holds each axle's own differential by axle number;
+    an axle without one uses `default_diff`. `centre` is what sits between the
+    front and rear axles, if anything. `filter_count` is how many low-pass
+    filters the lock controllers need integrated alongside the vehicle state."""
 
     gear_ratios: list[float]
     final_drive: float
     efficiency: float
     driven_stations: list[str]
-    diff_type: str = "open"
-    diff_preload: float = 0.0
-    diff_lock_power: float = 0.0
-    diff_lock_coast: float = 0.0
+    axle_diffs: dict[int, Differential] = field(default_factory=dict)
+    default_diff: Differential = field(default_factory=Differential)
+    centre: CentreSpec | None = None
+    filter_count: int = 0
     shift_time: float = 0.2
     inertia: float = 0.0
     clutch_capacity: float = 400.0     # maximum torque the clutch can carry (Nm)
@@ -641,33 +647,69 @@ def _build_powertrain(doc: dict[str, Any], stations: Sequence[Station],
     gearbox = clean(pt.get("gearbox") or {})
     ratios = [float(r) for r in (gearbox.get("ratios") or []) if isinstance(r, (int, float))]
     diffs = [clean(d) for d in (pt.get("differentials") or []) if isinstance(d, dict)]
-    half_shafts = clean(pt.get("half_shafts") or {})
-    driven = [s.name for s in stations if s.name in half_shafts]
-    if not driven:
-        driven = [s.name for s in stations if s.driven]
+    driven = infer_driven(pt, doc, stations, diffs, report)
+    for station in stations:                # the flag follows what the driveline drives
+        station.driven = station.name in driven
 
-    final_drive = 1.0
-    diff = {}
-    for entry in diffs:
-        if str(entry.get("location", "")).lower() != "center":
-            final_drive = num(entry, "final_drive", default=None) or final_drive
-            diff = entry
-            break
+    # Axle differentials: those not located at the centre. Each goes to the axle
+    # it names (`axle_ref`, or `location` front/rear); the first one also stands
+    # in for any driven axle that has none of its own, as the single differential
+    # of a car always did.
+    axle_numbers = sorted({s.axle for s in stations})
+    counter = [0]
+    axle_entries = [d for d in diffs
+                    if str(d.get("location", "")).lower() not in ("center", "inter_axle")]
+    parsed: list[tuple[int | None, Differential]] = []
+    for entry in axle_entries:
+        location = str(entry.get("location", "")).lower()
+        axle = (axle_number(entry.get("axle_ref")) if entry.get("axle_ref")
+                else axle_numbers[0] if location == "front"
+                else axle_numbers[-1] if location == "rear" else None)
+        parsed.append((axle if axle in axle_numbers else None,
+                       parse_differential(entry, counter, report,
+                                          f"differential {entry.get('id') or location or 'axle'}")))
+    axle_diffs: dict[int, Differential] = {}
+    for axle, diff in parsed:
+        if axle is not None and axle not in axle_diffs:
+            axle_diffs[axle] = diff
+    default_diff = parsed[0][1] if parsed else Differential()
+    final_drive = (num(axle_entries[0], "final_drive", default=None) or 1.0) if axle_entries else 1.0
+    if axle_entries:
+        drives = {round(num(d, "final_drive", default=final_drive) or final_drive, 3)
+                  for d in axle_entries}
+        if len(drives) > 1:
+            report.warn("the axle differentials have different final drives "
+                        f"({', '.join(f'{v:g}' for v in sorted(drives))}); SVJSim uses one "
+                        f"overall ratio ({final_drive:g}) for the whole driveline")
+    centre = parse_centre(pt, diffs, counter, report)
     if not ratios:
-        report.warn("no gearbox ratios — treated as a single direct gear")
+        report.warn("no gearbox ratios - treated as a single direct gear")
         ratios = [1.0]
+
+    driven_axles = {s.axle for s in stations if s.name in set(driven)}
+    if centre is not None and len(driven_axles) > 2 and centre.kind != "fixed":
+        report.warn("a centre differential or coupling is declared on a vehicle with "
+                    f"{len(driven_axles)} driven axles; SVJSim models the centre only "
+                    "between two, so the torque is shared by wheel count instead")
+    if centre is not None and len(driven_axles) < 2 and centre.kind != "fixed":
+        report.note("a centre differential or coupling is declared but only one axle is "
+                    "driven, so it has no effect")
+    if centre is not None and centre.kind == "coupling":
+        report.note(
+            "centre coupling: " + (f"{centre.mechanism}, " if centre.mechanism else "")
+            + f"{centre.ramp_torque:g} to {centre.max_torque:g} Nm. SVJ does not name the "
+              "primary axle, so it is taken as the one with the larger torque_split share "
+              "(the rear when none is given)")
 
     driveline = Driveline(
         gear_ratios=ratios, final_drive=final_drive,
         efficiency=num(gearbox, "efficiency", default=0.95) or 0.95,
         driven_stations=driven,
-        diff_type=str(diff.get("type", "open")),
-        diff_preload=num(diff, "preload", default=0.0) or 0.0,
-        diff_lock_power=num(diff, "lock_power", default=0.0) or 0.0,
-        diff_lock_coast=num(diff, "lock_coast", default=0.0) or 0.0,
+        axle_diffs=axle_diffs, default_diff=default_diff, centre=centre,
+        filter_count=counter[0],
         shift_time=num(gearbox, "shift_time", default=0.2) or 0.2,
         inertia=(num(gearbox, "inertia_output", default=0.0) or 0.0)
-        + (num(diff, "inertia", default=0.0) or 0.0),
+        + ((num(axle_entries[0], "inertia", default=0.0) or 0.0) if axle_entries else 0.0),
         clutch_capacity=num(pt, "clutch", "max_torque", default=None)
         or _default_clutch_capacity(engine))
     if not driven:

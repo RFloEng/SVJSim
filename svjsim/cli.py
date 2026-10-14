@@ -82,6 +82,18 @@ def cmd_info(args: argparse.Namespace) -> int:
         print(f"  driveline       {len(sim.driveline.gear_ratios)} gears, final drive "
               f"{sim.driveline.final_drive:.3f}, driving "
               f"{', '.join(sim.driveline.driven_stations) or 'nothing'}")
+        centre = sim.driveline.centre
+        if centre is not None and centre.kind == "coupling":
+            print(f"  centre          {centre.mechanism or 'coupling'}, "
+                  f"{centre.ramp_torque:g} to {centre.max_torque:g} Nm")
+        elif centre is not None and centre.kind == "diff":
+            print(f"  centre          {centre.diff.kind} differential")
+        controlled = sum(1 for d in [*sim.driveline.axle_diffs.values(),
+                                     *([centre.diff] if centre and centre.diff else [])]
+                         if d.chains)
+        if controlled:
+            print(f"  lock control    {controlled} differential(s) with lock_control "
+                  f"({sim.driveline.filter_count} filter state(s))")
 
     print("\n  station   load(N)  rate(kN/m)  ride(Hz)  damping  camber°   tire")
     for s in sim.stations:

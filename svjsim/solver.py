@@ -28,6 +28,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from .driveline import DrivePlan
 from .model import SimVehicle, Station
 from .util import G, cross3, euler_rates, rot_from_euler, skew
 
@@ -129,11 +130,14 @@ class State:
         12+3n  : 12+4n     lagged slip angle
         12+4n  : 12+5n     lagged slip ratio
         12+5n              engine speed (rad/s)
+        12+5n+1 :          low-pass filter states of the differential lock
+                           controllers, if the driveline has any (SVJ 10.8.1)
     """
 
-    def __init__(self, n: int, data: np.ndarray | None = None):
+    def __init__(self, n: int, data: np.ndarray | None = None, extra: int = 0):
         self.n = n
-        self.data = np.zeros(12 + 5 * n + 1) if data is None else np.asarray(data, dtype=float)
+        self.data = (np.zeros(12 + 5 * n + 1 + extra) if data is None
+                     else np.asarray(data, dtype=float))
 
     def copy(self) -> "State":
         return State(self.n, self.data.copy())
@@ -170,11 +174,16 @@ class State:
 
     @property
     def engine_speed(self) -> float:
-        return float(self.data[-1])
+        return float(self.data[12 + 5 * self.n])
 
     @engine_speed.setter
     def engine_speed(self, value: float) -> None:
-        self.data[-1] = value
+        self.data[12 + 5 * self.n] = value
+
+    @property
+    def filters(self) -> np.ndarray:
+        """Lock-controller filter states; empty when the driveline has none."""
+        return self.data[12 + 5 * self.n + 1:]
 
     @property
     def speed(self) -> float:
@@ -234,6 +243,9 @@ class VehicleDynamics:
             next((k for k, o in enumerate(self.stations) if o.name == s.arb_partner), None)
             for s in self.stations
         ]
+        # Where drive torque goes (axles, differentials, centre, lock control).
+        self.drive = (DrivePlan(vehicle.driveline, self.stations)
+                      if vehicle.driveline is not None and self.stations else None)
         # Wheel spin inertia including the share of driveline inertia reflected
         # through the final drive is applied in `_driveline_torque`.
         self.spin_inertia = np.array([max(0.05, s.spin_inertia) for s in self.stations])
@@ -304,7 +316,7 @@ class VehicleDynamics:
         # --- wheel stations -------------------------------------------
         outputs: list[WheelOutput] = []
         spin_torque = np.zeros(n)
-        drive = self._driveline_torque(state, controls)
+        drive, filter_rates = self._driveline_torque(state, controls)
 
         for i, station in enumerate(self.stations):
             j, jdot = float(state.jounce[i]), float(state.jounce_rate[i])
@@ -389,7 +401,9 @@ class VehicleDynamics:
             d[12 + 4 * n + i] = (vx / max(1e-3, station.tire.relaxation_longitudinal)) * \
                 (out.slip_ratio - float(state.slip_ratio[i]))
 
-        d[-1] = self._engine_derivative(state, controls)
+        d[12 + 5 * n] = self._engine_derivative(state, controls)
+        if len(filter_rates) and state.filters.size >= len(filter_rates):
+            d[12 + 5 * n + 1:12 + 5 * n + 1 + len(filter_rates)] = filter_rates
         return d, (outputs if collect else None)
 
     # -- contact and tire ----------------------------------------------
@@ -565,35 +579,19 @@ class VehicleDynamics:
         capacity = v.driveline.clutch_capacity * controls.clutch
         return float(capacity * np.tanh(slip / CLUTCH_SLIP_REFERENCE))
 
-    def _driveline_torque(self, state: State, controls: Controls) -> np.ndarray:
-        """Torque delivered to each station's wheel, in newton-metres."""
-        torque = np.zeros(self.n)
+    def _driveline_torque(self, state: State, controls: Controls) -> tuple[np.ndarray, np.ndarray]:
+        """Torque delivered to each station's wheel (N m), and the derivative of
+        the lock-controller filters that ride along in the state."""
         v = self.vehicle
-        if v.engine is None or v.driveline is None or not v.driveline.driven_stations:
-            return torque
+        none = (np.zeros(self.n), np.zeros(0))
+        if v.engine is None or v.driveline is None or self.drive is None                 or not v.driveline.driven_stations:
+            return none
         ratio = v.driveline.ratio(controls.gear)
         if ratio <= 0.0:
-            return torque
-
+            return none
         shaft = self._clutch_torque(state, controls) * ratio * v.driveline.efficiency
-
-        driven = [i for i, s in enumerate(self.stations) if s.name in v.driveline.driven_stations]
-        if not driven:
-            return torque
-        share = shaft / len(driven)
-        for i in driven:
-            torque[i] = share
-
-        # A limited-slip differential moves torque towards the slower wheel.
-        lock = v.driveline.diff_lock_power if shaft >= 0 else v.driveline.diff_lock_coast
-        if lock > 0.0 and len(driven) == 2:
-            a, b = driven
-            delta = float(state.spin[a] - state.spin[b])
-            transfer = lock * abs(share) * np.tanh(delta * 2.0) + \
-                v.driveline.diff_preload * np.tanh(delta * 10.0)
-            torque[a] -= transfer
-            torque[b] += transfer
-        return torque
+        filters = state.filters if state.filters.size else None
+        return self.drive.torques(state, controls, shaft, filters)
 
     def _engine_derivative(self, state: State, controls: Controls) -> float:
         """Engine speed from its own torque less what the clutch takes away."""
@@ -616,7 +614,7 @@ class VehicleDynamics:
 
     def initial_state(self, speed: float = 0.0, gear: int = 1) -> State:
         """A state with the vehicle at its design attitude, rolling at `speed`."""
-        state = State(self.n)
+        state = State(self.n, extra=self.drive.filter_count if self.drive is not None else 0)
         state.velocity[0] = speed
         # Lift the body so each tire carries its static load.
         offsets = []
@@ -633,6 +631,9 @@ class VehicleDynamics:
             ratio = self.vehicle.driveline.ratio(gear)
             idle = self.vehicle.engine.idle_rpm * 2 * np.pi / 60.0
             state.engine_speed = max(idle, float(np.mean(state.spin)) * ratio)
+        if self.drive is not None and self.drive.filter_count:
+            inputs = self.drive.inputs(state, Controls(gear=gear))
+            state.filters[:] = self.drive.initial_filters(inputs)
         return state
 
     def trim(self, speed: float = 0.0, gear: int = 1, duration: float = 3.0,

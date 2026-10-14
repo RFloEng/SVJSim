@@ -74,6 +74,12 @@ steering, powertrain and aero parts ride on the chassis. If the mesh file sits
 somewhere the app can't find, *Load .glb…* (or dropping it with the JSON)
 supplies it.
 
+**A driveline that follows the file.** Engine torque goes through a centre
+stage (fixed split, centre differential, or a torque-limited coupling) and one
+differential per axle, and differential locks can be modulated by gear, pedals,
+speed, axle speed ratio and slip angles (SVJ `lock_control`), so an on-demand
+all-wheel-drive car actually behaves like one.
+
 **Tire forces and friction circles, live.** A checkbox over the 3D view draws,
 at each wheel's contact patch, a ring sized to the tire's currently available
 grip, an arrow for the horizontal force it's actually using, and a vertical

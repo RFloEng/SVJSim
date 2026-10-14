@@ -130,6 +130,34 @@ once at the design pose so a part never flips mid-travel. All assets of one
 file share one set of axes (§22.4 is per file), decided from the chassis's
 asset, because a small asset can't be read from its shape.
 
+### The driveline
+
+`driveline.py` turns the powertrain block into three stages, applied inside
+every derivative evaluation: the **centre** splits the shaft torque between
+driven axles (a fixed `torque_split`, a `center_diff`, or a torque-limited
+`transfer_case.coupling`), each **axle differential** shares its torque between
+its two wheels, and any differential's **`lock_control`** (SVJ §10.8.1)
+modulates its lock from gear, pedals, speed, axle speed ratio and slip angles.
+Which wheels are driven comes from `half_shafts`, then `axles[].driven`, then
+the layout / `drive_type`, then where the differentials are located; the source
+used is recorded in the build report. A lock controller's stage filters are
+first-order states, so they live in the `State` vector after the engine speed
+and are integrated by the same RK4 step; they start at what their stage outputs
+rather than at zero.
+
+The spec fixes what each field means, not the dynamics behind it, so a few
+modelling choices are SVJSim's own and are stated in the module docstring and
+the build report: a `lock` chain runs from the static `lock_power` and
+`lock_coast` in turn; a coupling's primary axle is the one with the larger
+`torque_split` share (the rear when none is given); its capacity rises from
+`ramp_torque` to `max_torque` with the axle speed difference and is scaled by a
+`center_diff` given alongside; centre torques are referred to the wheels
+through the final drive (the coupling sits ahead of the axle differentials);
+slip-angle inputs are magnitudes; `oversteer_factor` is
+`(|a_rear| - |a_front|) / (|a_rear| + |a_front| + 0.01)`. The differential
+lock itself is the original `tanh` model, now limited to the smaller nominal
+share so that an unequal split cannot be pushed negative.
+
 ### The equations of motion
 
 Generalized coordinates are the six sprung-mass freedoms plus one wheel-travel
@@ -234,6 +262,10 @@ roll-centre heights or anti-percentages anywhere in the code.
   that use them — a different problem from the axle kinematics above (this
   one is mass/spring load-sharing *between* axles, via a rocker, beam or
   fluid circuit, not the rigid-body kinematics *within* one axle).
+- **One overall ratio for the whole driveline.** Axle differentials with
+  different final drives are reported and the first one's is used; a centre
+  device is modelled between exactly two driven axles (with more, torque is
+  shared by wheel count). Custom `x_` lock-control inputs are skipped.
 - **No compliance.** Tier 2 `compliance_summary` and Tier 3 bushings are parsed
   but not applied; all joints are rigid.
 - **No thermal models.** Tire, brake and engine thermal data is read but not

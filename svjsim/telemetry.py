@@ -101,6 +101,7 @@ class Recorder:
             row[f"steer_{p}"] = wheel.steer
             row[f"jounce_{p}"] = float(state.jounce[i])
             row[f"spin_{p}"] = float(state.spin[i])
+            row[f"drive_torque_{p}"] = wheel.drive_torque
             row[f"grip_used_{p}"] = wheel.load_ratio
             total_load += wheel.Fz
         row["Fz_total"] = total_load

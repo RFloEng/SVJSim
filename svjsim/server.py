@@ -36,7 +36,7 @@ from .model import SimVehicle, build_vehicle, static_alignment
 from .realtime import RealtimeSession
 from .solver import Environment, Road, VehicleDynamics
 from .telemetry import Result
-from .util import dig, merge_patch, num, vec3
+from .util import dig, merge_patch, num, point3, vec3
 
 APP_HTML = Path(__file__).with_name("webapp.html")
 MAX_ASSET_BYTES = 400 * 2**20          # the biggest hand-picked mesh accepted
@@ -313,8 +313,8 @@ def find_visual_bindings(doc: dict[str, Any]) -> list[dict[str, Any]]:
     def link_ends(carrier: dict[str, Any], visual: dict[str, Any],
                   entry: dict[str, Any]) -> bool:
         """Fill in a link binding's two ends; False if the link doesn't have them."""
-        points = [list(map(float, p)) for p in (carrier.get("inboard_points") or [])
-                  if isinstance(p, (list, tuple)) and len(p) == 3]
+        points = [q for q in (point3(p) for p in (carrier.get("inboard_points") or []))
+                  if q is not None]
         outboard = str(carrier.get("outboard_ref", "")).split(".")[-1]
         if not points or not outboard:
             entry["issue"] = "link_between_points needs inboard_points and an outboard_ref"
@@ -370,9 +370,9 @@ def find_visual_bindings(doc: dict[str, Any]) -> list[dict[str, Any]]:
             entry.update(kind="body", part="steering")
         elif re.match(r"^\.powertrain\.driveshafts\[\d+\]$", path):
             entry["part"] = "driveshaft"
-            ends = [vec3(carrier.get(key) or {}, "position") for key in ("joint_front", "joint_rear")]
+            ends = [point3(carrier.get(key)) for key in ("joint_front", "joint_rear")]
             if between and all(end is not None for end in ends):
-                entry.update(kind="segment", **{"from": ends[0].tolist(), "to": ends[1].tolist()})
+                entry.update(kind="segment", **{"from": ends[0], "to": ends[1]})
             else:
                 if between:
                     entry["issue"] = "link_between_points needs joint_front/joint_rear positions"
@@ -518,13 +518,17 @@ def _station_geometry(vehicle: SimVehicle, station: Any,
                       base_document: dict[str, Any] | None = None) -> dict[str, Any]:
     corner = dig(vehicle.source, "suspension", station.name, default={}) or {}
     topology = dig(corner, "topology", default={}) or {}
-    hardpoints = {k: list(map(float, v)) for k, v in
-                  (dig(topology, "upright", "hardpoints", default={}) or {}).items()
-                  if isinstance(v, (list, tuple)) and len(v) == 3}
+    # A point is either `[x, y, z]` or a v0.96 marker `{position, orientation}`;
+    # the solver reads both (`vec3`), so the viewer must too, or a link whose
+    # points are markers simply vanishes from the 3D view.
+    hardpoints = {k: q for k, q in
+                  ((k, point3(v)) for k, v in
+                   (dig(topology, "upright", "hardpoints", default={}) or {}).items())
+                  if q is not None}
     links = []
     for link in topology.get("links") or []:
-        inboard = [list(map(float, p)) for p in (link.get("inboard_points") or [])
-                   if isinstance(p, (list, tuple)) and len(p) == 3]
+        inboard = [q for q in (point3(p) for p in (link.get("inboard_points") or []))
+                   if q is not None]
         ref = str(link.get("outboard_ref", "")).split(".")[-1]
         if inboard and ref in hardpoints:
             links.append({"name": link.get("name", "link"),
